@@ -36,13 +36,24 @@ def _cnki_mcp_available() -> bool:
 
 
 def _run_cli(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
-    """在 cnki-mcp 仓库目录内执行 CLI 命令，返回 (退出码, stdout, stderr)。"""
+    """在 cnki-mcp 仓库目录内执行 CLI 命令，返回 (退出码, stdout, stderr)。
+
+    执行前会用 cnki-mcp 仓库内的 `edge_patch.py` 复用系统 Edge/Chrome，
+    避免下载 Playwright 自带 Chromium（国内下载极慢/常失败）。
+    """
     import subprocess
 
+    repo = Path(_CNKI_MCP_REPO)
+    # 预置补丁：把 Playwright 的浏览器启动指向系统 Edge/Chrome
+    prelude = (
+        "import edge_patch; "
+        "edge_patch.patch_playwright_browser(); "
+        "from cnki_mcp.cli.main import main; main()"
+    )
     try:
         proc = subprocess.run(
-            ["uv", "run", "cnki-mcp", *args],
-            cwd=str(Path(_CNKI_MCP_REPO)),
+            ["uv", "run", "python", "-c", prelude, *args],
+            cwd=str(repo),
             capture_output=True,
             text=True,
             timeout=timeout,
