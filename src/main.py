@@ -32,6 +32,7 @@ from src.tools.literature_tool import literature_search, search_literature
 from src.tools.openalex_tool import openalex_search, search_openalex
 from src.tools.crossref_tool import crossref_search, search_crossref
 from src.tools.cnki_tool import cnki_search, search_cnki, build_advanced_query
+from src.tools.query_translator import translate_to_english_queries
 from src.tools.core_journals import CORE_JOURNALS, CORE_JOURNAL_GROUPS
 
 
@@ -283,31 +284,41 @@ def _chinese_portion(topic: str) -> str:
     return " ".join(cn).strip()
 
 
-def _english_portion(topic: str) -> str:
-    """提取检索词中的英文部分（供英文学术库使用）。
+def _english_queries(topic: str, max_queries: int = 2) -> list[str]:
+    """生成用于英文库检索的检索式列表。
 
-    纯中文主题不查英文库——实测中文词会被英文库按模糊匹配返回
-    完全无关的内容（如"水母幼虫""飞溅侵蚀"）。
+    - 原词含英文 → 直接取英文部分（中英混写场景）；
+    - 纯中文 → 交 LLM 转换出国际期刊通用术语（见 query_translator）。
+
+    最多返回 max_queries 条，避免请求过多触发英文库限流。
     """
-    return " ".join(re.findall(r"[A-Za-z][A-Za-z\-]*", topic or "")).strip()
+    en = " ".join(re.findall(r"[A-Za-z][A-Za-z\-]*", topic or "")).strip()
+    if en:
+        return [en]
+    if _chinese_portion(topic):
+        return translate_to_english_queries(_chinese_portion(topic), max_queries)
+    return []
 
 
 def fetch_literature_grounded(topic: str, limit: int = 15):
-    """多源容错抓取真实文献：Semantic Scholar → OpenAlex → Crossref。
+    """多源容错抓取真实文献：知网（中文）+ Semantic Scholar/OpenAlex/Crossref（英文）。
 
-    策略：依次尝试三个真实学术源，**合并所有成功源的结果并做中英文均衡**
-    （避免单一源被限流时只能拿到某一种语种），再做质量过滤。
-    三源均失败时如实返回失败原因，绝不编造。
+策略：
+1. 检索词含中文 → 走知网（中文核心刊唯一可靠来源）；
+2. 英文检索式：若原词已含英文则直接用；**若为纯中文，则用 LLM 转换**
+   （中文词直接喂英文库会返回「水母幼虫」这类无关内容）；
+3. 各源结果合并去重 → 质量过滤（中文按北大核心白名单）→ 中英文均衡。
 
-    返回 (raw_text, source_name, papers, warn)。
+全部源失败时如实返回失败原因，绝不编造。
+
+返回 (raw_text, source_name, papers, warn)。
     """
     collected = []
     used_sources = []
     errors = []
 
     # 【中文主源】知网 —— 中文核心刊的唯一可靠来源。
-    # 检索词含中文时走知网（开放库的中文部分以付费灌水刊为主）。
-    # 用普通主题词先广召回，再由 assess_quality 按北大核心白名单过滤；
+    # 用专业检索式广召回，再由 assess_quality 按北大核心白名单过滤；
     # 不做 LY 期刊限定——单期刊召回过少，反而漏掉其它核心刊成果。
     zh_query = _chinese_portion(topic)
     if zh_query:
@@ -319,12 +330,16 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
         else:
             errors.append(f"- **知网**：{(raw_cnki or '').strip()[:160]}")
 
-    # 【英文源】仅当检索词含英文时才查。
-    # 纯中文词喂给英文库会按模糊匹配返回完全无关的内容
-    # （实测"侧流生物除磷"→ Crossref 返回"水母幼虫""飞溅侵蚀"），
-    # 故此场景只走知网，避免污染结果。
-    en_query = _english_portion(topic)
-    if en_query:
+    # 【英文源】英文检索式来源：
+    #   - 原词含英文 → 直接使用；
+    #   - 纯中文 → LLM 转成国际期刊通用术语（避免中文词污染英文库）。
+    en_queries = _english_queries(topic)
+    if not en_queries and zh_query:
+        errors.append(
+            "- **英文检索**：未能从中文主题生成英文检索式（LLM 不可用），"
+            "本次仅检索中文文献"
+        )
+    for en_query in en_queries:
         for name, fn in (
             ("Semantic Scholar", search_literature),
             ("OpenAlex", search_openalex),
@@ -375,7 +390,7 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
     # 中文至少保留 1/3（最低 2 篇），其余留给英文
     balanced = []
     if zh and en:
-        take_zh = min(len(zh), max(limit // 3, 2))
+        take_zh = min(len(zh), max(limit // 3, 2))  # 中文至少 1/3，下限 2 篇
         take_en = min(len(en), limit - take_zh)
         balanced = zh[:take_zh] + en[:take_en]
     elif zh:
@@ -384,7 +399,8 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
         balanced = en[:limit]
 
     # 重建注入给 Crew 的上下文文本
-    lines = [f"# 真实检索结果（来源：{'/'.join(used_sources)}，严禁编造、严禁替换）"]
+    uniq_sources = list(dict.fromkeys(used_sources))
+    lines = [f"# 真实检索结果（来源：{'/'.join(uniq_sources)}，严禁编造、严禁替换）"]
     for p in kept:
         # 知网记录的 venue 字段可能是期刊名，也可能是学位授予单位
         kind = ""
@@ -395,7 +411,7 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
             f"DOI:{p['doi']} | 被引:{p['citations']} | 语言:{p['lang']}"
         )
     raw_ctx = "\n".join(lines)
-    return raw_ctx, "+".join(used_sources), kept, warn
+    return raw_ctx, "+".join(dict.fromkeys(used_sources)), kept, warn
 
 
 def main():
