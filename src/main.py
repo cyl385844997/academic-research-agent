@@ -397,8 +397,10 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
     # 中文至少保留 1/3（最低 2 篇），其余留给英文
     balanced = []
     if zh and en:
-        take_zh = min(len(zh), max(limit // 3, 2))  # 中文至少 1/3，下限 2 篇
-        take_en = min(len(en), limit - take_zh)
+        # 中文核心刊数量本就少（多在 2-5 篇），均衡时**先把中文全部保住**，
+        # 再用剩余配额补英文——否则会出现「中 2 / 英 57」这种失衡。
+        take_zh = min(len(zh), max(limit // 2, 3))
+        take_en = max(limit - take_zh, min(len(en), limit // 2))
         balanced = zh[:take_zh] + en[:take_en]
     elif zh:
         balanced = zh[:limit]
