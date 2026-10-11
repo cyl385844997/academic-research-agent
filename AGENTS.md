@@ -22,13 +22,29 @@
 ## 目录职责
 | 路径 | 职责 |
 |------|------|
-| `src/tools/literature_tool.py` | Semantic Scholar 真实文献检索（返回真实 DOI） |
+| `src/tools/literature_tool.py` | Semantic Scholar 真实文献检索（首选源，返回真实 DOI） |
+| `src/tools/openalex_tool.py` | OpenAlex 备用文献检索（第二回退源） |
+| `src/tools/crossref_tool.py` | Crossref 备用文献检索（第三回退源，已过滤审稿意见等非论文记录） |
 | `src/tools/web_tool.py` | Web 检索（Tavily / DuckDuckGo） |
 | `src/crews/literature_crew.py` | 论文检索三角色：检索员→分析员→撰稿员 |
 | `src/crews/market_crew.py` | 市场调研三角色 |
-| `src/main.py` | CLI 入口：`--mode literature|market --topic "..."` |
+| `src/main.py` | CLI 入口：`--mode literature|market --topic "..."`；含三级文献源容错 |
 | `knowledge/` | 领域知识沉淀（v0.2 起），当前为空 |
 | `reports/` | 生成报告，默认不入库 |
+
+## 多源容错（文献检索）
+`fetch_literature_grounded()` 依次尝试 **Semantic Scholar → OpenAlex → Crossref**，
+任一成功即用；三者均失败时**如实报告失败原因**并给出解决建议，绝不编造文献。
+实测：免费源在同一 IP 短时间内高频调用会被限流（S2 429 / OpenAlex 503），
+因此不要在调试时反复轰炸单一源；需要稳定高频使用应配置官方 API key。
+
+## 可溯源铁律的实现方式（重要）
+**文献表 / 来源表一律由代码生成，LLM 绝不参与其生成。**
+- `main.py` 先直接调用检索工具获取真实记录 → 解析 → 写出权威 TSV；
+- 真实结果作为上下文注入 Crew，Agent **只做分析**，并在任务中明确禁止编造文献/来源；
+- 报告生成后，代码剥离 Agent 可能夹带的伪造表格，追加由真实数据生成的表格。
+- 任何改动都不得让 LLM 负责「列出参考文献」这件事，否则会出现
+  「真实 DOI 指向错误论文」或「DOI 根本不存在」的编造事故。
 
 ## 运行（开发期）
 ```bash
