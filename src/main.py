@@ -31,6 +31,109 @@ from src.crews.market_crew import build_market_crew
 from src.tools.literature_tool import literature_search, search_literature
 from src.tools.openalex_tool import openalex_search, search_openalex
 from src.tools.crossref_tool import crossref_search, search_crossref
+from src.tools.core_journals import CORE_JOURNALS, CORE_JOURNAL_GROUPS
+
+
+def _norm_venue(s: str) -> str:
+    """归一化期刊名：去除空白与常见副标题分隔符，便于与白名单比对。
+
+    Crossref/OpenAlex 返回的刊名可能带"(中英文)"、空格或全半角差异，
+    直接比较会漏判，故先归一化。
+    """
+    s = (s or "").strip()
+    # 去掉中英文标记、空格、点号等噪声
+    for ch in (" ", "　", "·", "・", ".", "．", "（", "）", "(", ")"):
+        s = s.replace(ch, "")
+    return s
+
+
+_NORM_CORE = {_norm_venue(j) for j in CORE_JOURNALS}
+
+
+def _is_core_journal(venue: str) -> bool:
+    """判断期刊是否在北大核心白名单内（归一化后精确匹配）。"""
+    v = _norm_venue(venue)
+    if not v or v == "?":
+        return False
+    if v in _NORM_CORE:
+        return True
+    # 部分源会追加"（中英文）"等后缀，做前缀匹配兜底
+    return any(v.startswith(j) or j.startswith(v) for j in _NORM_CORE if len(j) >= 4)
+
+
+def assess_quality(papers, topic=""):
+    """对检索结果做质量评估，返回 (过滤后列表, 预警信息或None)。
+
+    **中文文献的唯一判据是北大核心期刊白名单**（见 tools/core_journals.py，
+    源自用户提供的《北大中文核心期刊要目总览》2023年版第十版）：
+    - 中文文献：不在白名单内 → 一律剔除（中文库多为付费灌水刊）；
+    - 英文文献：按主题相关性过滤，不做期刊限制（英文库本身质量可靠）。
+
+    结果质量偏低时主动提示换检索词——宁可提示，也不闷头输出低质文献。
+    """
+    kept, dropped = [], []
+
+    def tokens(s: str):
+        """中文取连续汉字串、英文取>=3字母的词，用于相关性比对。"""
+        s = (s or "").lower()
+        return set(re.findall(r"[\u4e00-\u9fff]{2,}", s)), set(re.findall(r"[a-z]{3,}", s))
+
+    topic_cn, topic_en = tokens(topic)
+
+    def relevant(title: str, lang: str) -> bool:
+        """判断标题是否与检索词相关。
+
+        **按语种分别比对**：中英混写的检索词里，中文文献不可能包含
+        "sewer/pipeline" 等英文词，反之亦然；跨语种比对会误杀全部中文文献。
+        """
+        t_cn, t_en = tokens(title)
+        if lang == "zh":
+            return (not topic_cn) or bool(topic_cn & t_cn)
+        return (not topic_en) or bool(topic_en & t_en)
+
+    for p in papers:
+        lang = p.get("lang", "en")
+        venue = p.get("venue") or ""
+
+        # 中文文献：白名单是唯一判据
+        if lang == "zh":
+            if not _is_core_journal(venue):
+                dropped.append((p, f"非北大核心期刊（{venue or '未标注'}）"))
+                continue
+            # 核心刊也可能跑题，仍做相关性校验
+            if topic_cn and not (topic_cn & tokens(p.get("title", ""))[0]):
+                dropped.append((p, "主题不相关"))
+                continue
+            kept.append(p)
+            continue
+
+        # 英文文献：只做主题相关性过滤
+        if topic_en and not (topic_en & tokens(p.get("title", ""))[1]):
+            dropped.append((p, "主题不相关"))
+            continue
+        kept.append(p)
+
+    warn = None
+    n_zh_kept = sum(1 for p in kept if p["lang"] == "zh")
+    if not n_zh_kept and any(p["lang"] == "zh" for p in papers):
+        warn = (
+            f"⚠️ 中文文献全部被过滤：检索到的中文记录均不在北大核心期刊白名单内"
+            f"（共剔除 {sum(1 for p in papers if p['lang'] == 'zh')} 篇）。\n"
+            f"原因：中文免费库（尤其 Crossref 中文部分）以付费灌水刊为主。\n"
+            f"建议：① 知网/万方需人工补检（本项目不爬取付费库）；"
+            f"② 优先用英文检索获取高质量文献；"
+            f"③ 或换用核心刊常见的主题词（如「城镇污水处理」「排水管网」）。"
+        )
+    elif not kept:
+        warn = (
+            f"⚠️ 检索到的 {len(dropped)} 条记录全部被过滤。建议更换检索关键词。"
+        )
+    elif len(dropped) / max(len(papers), 1) >= 0.5:
+        warn = (
+            f"⚠️ 质量过滤：{len(dropped)}/{len(papers)} 条被剔除"
+            f"（中文按北大核心白名单，英文按主题相关性）。"
+        )
+    return kept, warn
 from src.tools.web_tool import web_search, search_web
 
 
@@ -52,8 +155,18 @@ def get_llm():
     return LLM(**kwargs)
 
 
+
+def _parse_citations(raw: str):
+    """从 '被引:N' 片段解析被引数（无法解析返回 None）。"""
+    m = re.search(r"被引:\s*(\d+)", raw)
+    return int(m.group(1)) if m else None
+
+
 def parse_ss_papers(raw: str):
-    """从 literature_search 的真实返回中解析出结构化文献列表（标题/年份/作者/DOI/期刊/被引）。"""
+    """从检索工具的真实返回中解析出结构化文献列表。
+
+    输出列：标题/年份/作者/DOI/期刊/被引/语种。
+    """
     papers = []
     for line in raw.splitlines():
         s = line.strip()
@@ -73,12 +186,29 @@ def parse_ss_papers(raw: str):
         venue = parts[2]
         doi = parts[3].replace("DOI:", "", 1).strip()
         cit = parts[4].replace("被引:", "", 1).strip()
+        lang = "?"
+        if len(parts) >= 6:
+            lang = parts[5].replace("语言:", "", 1).strip()
         if not doi or doi == "N/A":
             continue
+        # 语种最终以标题实际字符判定：数据源的 language 字段不可靠
+        # （OpenAlex 实测会把中文期刊标成 en），字符判定最稳。
+        cjk = sum(1 for ch in title if "\u4e00" <= ch <= "\u9fff")
+        lang = "zh" if cjk >= 3 else "en"
         papers.append(
-            {"title": title, "year": year, "authors": authors, "doi": doi, "venue": venue, "citations": cit}
+            {
+                "title": title,
+                "year": year,
+                "authors": authors,
+                "doi": doi,
+                "venue": venue,
+                "citations": cit,
+                "lang": lang,
+            }
         )
     return papers
+
+
 
 
 def parse_web_results(raw: str):
@@ -121,33 +251,85 @@ def append_grounded_refs(report_path: str, block: str):
 
 
 def fetch_literature_grounded(topic: str, limit: int = 15):
-    """多源容错抓取真实文献：Semantic Scholar → OpenAlex → Crossref 依次回退。
+    """多源容错抓取真实文献：Semantic Scholar → OpenAlex → Crossref。
 
-    三个源均返回真实可溯源的学术记录。这是「可溯源铁律」的基准数据：
-    由代码直接调用真实学术库获取，LLM 不参与。全部失败时如实返回空，
-    由报告告知用户原因，绝不编造。
+    策略：依次尝试三个真实学术源，**合并所有成功源的结果并做中英文均衡**
+    （避免单一源被限流时只能拿到某一种语种），再做质量过滤。
+    三源均失败时如实返回失败原因，绝不编造。
+
+    返回 (raw_text, source_name, papers, warn)。
     """
-    attempts = []
-    # 依次尝试三个真实学术源
+    collected = []
+    used_sources = []
+    errors = []
+
+    # 依次尝试三个真实学术源，合并去重后统一做中英文均衡。
+    # 不做提前停止：某源可能只返回单一语种（如中文词命中中文刊），
+    # 提前停止会漏掉另一语种的优质文献。
     for name, fn in (
         ("Semantic Scholar", search_literature),
         ("OpenAlex", search_openalex),
         ("Crossref", search_crossref),
     ):
         raw = fn(topic, limit)
-        papers = parse_ss_papers(raw)  # 三源输出格式一致，复用解析器
+        papers = parse_ss_papers(raw)
+        # **Crossref 的中文库基本是灌水刊集散地**，只取其英文记录，
+        # 中文文献交由 OpenAlex（收录更严谨且有 language 字段）负责。
+        if name == "Crossref":
+            en_only = [p for p in papers if p["lang"] != "zh"]
+            zh_dropped = len(papers) - len(en_only)
+            papers = en_only
+            if zh_dropped:
+                errors.append(
+                    f"- **Crossref**：已跳过 {zh_dropped} 条中文记录"
+                    f"（该库中文部分以付费灌水刊为主，质量不可信）"
+                )
         if papers:
-            return raw, name, papers
-        attempts.append(f"- **{name}**：{raw.strip()[:200]}")
+            collected.extend(papers)
+            used_sources.append(name)
 
-    # 三源都失败：如实返回失败信息（报告会转述，绝不编造）
-    fail_msg = (
-        "经依次尝试，以下检索渠道均未返回可用结果：\n"
-        + "\n".join(attempts)
-        + "\n\n建议：稍后重试；或配置 SEMANTIC_SCHOLAR_API_KEY 提升速率；"
-        "或缩短检索关键词。"
-    )
-    return fail_msg, "无（三个源均失败）", []
+    if not collected:
+        fail_msg = (
+            "经依次尝试，以下检索渠道均未返回可用结果：\n"
+            + "\n".join(errors)
+            + "\n\n建议：稍后重试；或配置 SEMANTIC_SCHOLAR_API_KEY 提升速率；或缩短检索关键词。"
+        )
+        return fail_msg, "无（三个源均失败）", [], None
+
+    # 去重（按 DOI）
+    seen = set()
+    uniq = []
+    for p in collected:
+        k = p["doi"].lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+
+    # 中英文均衡：中文库通常返回较少，按比例补足
+    zh = [p for p in uniq if p["lang"] == "zh"]
+    en = [p for p in uniq if p["lang"] != "zh"]
+    balanced = []
+    if zh and en:
+        take_zh = min(len(zh), max(limit // 3, 1))
+        take_en = min(len(en), limit - take_zh)
+        balanced = zh[:take_zh] + en[:take_en]
+    elif zh:
+        # 只有中文可用：全量中文，并提示可补英文词以获得英文文献
+        balanced = zh[:limit]
+    else:
+        balanced = en[:limit]
+
+    kept, warn = assess_quality(balanced, topic)
+
+    # 重建注入给 Crew 的上下文文本
+    lines = [f"# 真实检索结果（来源：{'/'.join(used_sources)}，严禁编造、严禁替换）"]
+    for p in kept:
+        lines.append(
+            f"- {p['title']} ({p['year']}) | {p['authors']} | {p['venue']} | "
+            f"DOI:{p['doi']} | 被引:{p['citations']} | 语言:{p['lang']}"
+        )
+    raw_ctx = "\n".join(lines)
+    return raw_ctx, "+".join(used_sources), kept, warn
 
 
 def main():
@@ -167,27 +349,43 @@ def main():
 
     if args.mode == "literature":
         # 1) 真实检索：可溯源铁律的基准数据（由代码持有，LLM 不碰）
-        raw, source, papers = fetch_literature_grounded(args.topic, 15)
+        print("[1/3] 正在检索真实学术库（Semantic Scholar → OpenAlex → Crossref）...")
+        raw, source, papers, warn = fetch_literature_grounded(args.topic, 15)
+        if warn:
+            print(warn)
+
+        n_zh = sum(1 for p in papers if p["lang"] == "zh")
+        n_en = len(papers) - n_zh
+        print(f"      来源={source}｜中文文献 {n_zh} 篇｜英文文献 {n_en} 篇")
+
         ref_tsv = os.path.join("reports", "literature_references.tsv")
-        tsv_lines = ["标题\t年份\t作者\tDOI\t期刊\t被引"]
+        tsv_lines = ["标题\t年份\t作者\tDOI\t期刊\t被引\t语种"]
         for p in papers:
-            tsv_lines.append(f"{p['title']}\t{p['year']}\t{p['authors']}\t{p['doi']}\t{p['venue']}\t{p['citations']}")
+            tsv_lines.append(
+                f"{p['title']}\t{p['year']}\t{p['authors']}\t{p['doi']}\t"
+                f"{p['venue']}\t{p['citations']}\t{p['lang']}"
+            )
         with open(ref_tsv, "w", encoding="utf-8") as f:
             f.write("\n".join(tsv_lines) + "\n")
+
         # 2) 注入真实结果运行 Crew（只做分析，不生成文献表）
+        print("[2/3] 正在运行 CrewAI 三角色分析（通常 2-5 分钟，请耐心等待）...")
         crew = build_literature_crew(args.topic, llm, tools, search_results=raw)
         crew.kickoff()
+
         # 3) 后处理：剥离可能伪造的 TSV，追加真实 TSV
+        print("[3/3] 正在生成报告...")
         report_path = os.path.join("reports", "literature_report.md")
         tsv_block = (
-            "## TSV 文献表（真实检索结果，系统自动生成，绝不编造）\n\n```\n"
+            "## 文献表（真实检索结果，系统按代码生成，绝不编造）\n\n"
+            f"来源：{source}｜中文 {n_zh} 篇 + 英文 {n_en} 篇\n\n```\n"
             + "\n".join(tsv_lines)
             + "\n```"
         )
         append_grounded_refs(report_path, tsv_block)
         print(
             f"\n===== 完成：报告={report_path}，真实文献 {len(papers)} 篇"
-            f"（来源：{source}），TSV={ref_tsv} =====\n"
+            f"（中 {n_zh} / 英 {n_en}，来源：{source}），TSV={ref_tsv} =====\n"
         )
 
     else:  # market
