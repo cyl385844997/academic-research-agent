@@ -4,8 +4,7 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
-# 生成的报告产物不入库（按需保留可去掉下行）
-reports/*.md
-!reports/.gitkeep
+# 生成的报告产物不入库（含 .md 报告与 .tsv 文献表）
+reports/*
 *.log
 .DS_Store

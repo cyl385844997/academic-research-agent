@@ -1,15 +1,14 @@
 """Web 网络检索工具：优先 Tavily（需 key），回退 DuckDuckGo（ddgs，免 key）。
 
 用于市场调研、竞品分析、政策与最新动态搜索——这类信息没有学术 DOI，
-需靠 Web 检索覆盖。
+需靠 Web 检索覆盖。同样导出纯函数 `search_web(...)` 与 CrewAI 工具 `web_search`。
 """
 import os
 import requests
 from crewai.tools import tool
 
 
-@tool("Web 网络检索")
-def web_search(query: str, max_results: int = 8) -> str:
+def search_web(query: str, max_results: int = 8) -> str:
     """检索互联网网页，返回标题、链接与摘要片段。
 
     优先使用 Tavily API；未配置时回退到 DuckDuckGo（ddgs）。
@@ -44,3 +43,7 @@ def web_search(query: str, max_results: int = 8) -> str:
         return "\n".join(out) or "DuckDuckGo 未返回结果。"
     except Exception as exc:  # noqa: BLE001
         return f"DuckDuckGo 检索失败：{exc}"
+
+
+# 给 CrewAI 用的工具包装
+web_search = tool("Web 网络检索")(search_web)
