@@ -16,6 +16,7 @@
 **绝不因中文检索失败而编造文献**。
 """
 import os
+import re
 import sys
 import shutil
 from pathlib import Path
@@ -58,6 +59,71 @@ def _run_cli(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
         return 124, "", f"知网检索超时（>{timeout}s），可能未登录或网络受限"
     except Exception as exc:  # noqa: BLE001
         return 1, "", f"知网检索异常：{exc}"
+
+
+def build_advanced_query(topic: str, journal: str = "") -> str:
+    """把普通中文主题词转换为知网专业检索式（显著提升召回质量）。
+
+    实测对比（主题「侧流生物除磷」）：
+      - 普通关键词检索            → 只返回 2 篇
+      - `SU='侧流' * '除磷'`       → 返回 15 篇，且多为核心刊
+
+    检索式语法（知网官方）：
+        SU=主题  TKA=篇关摘  KY=关键词  TI=篇名  AB=摘要
+        LY=文献来源  DOI=DOI  CF=被引频次  AU=作者  AF=作者单位
+        多词 `*`=与、`+`=或、`-`=非
+
+    切词原则：**不做机械滑窗切分**。实测 2-gram 滑窗会产出「流生」「物除」
+    这类跨词垃圾，导致检索式命中 0 篇。改为：
+      - 优先用空格/标点分隔的独立词块；
+      - 无分隔的长词直接整体作为主题词（知网 SU 支持长词组）；
+      - 只有当整体词过长（>8 字）且确需拆分时才用 2-gram 兜底。
+
+    Args:
+        topic: 中文主题词，如「侧流生物除磷」
+        journal: 可选，限定期刊（配合北大核心白名单精准检索）
+    """
+    import re as _re
+
+    # 1) 先取空格/标点分隔的独立词块
+    blocks = [b for b in _re.split(r"[\s\-/、,，]+", topic or "") if b]
+    tokens: list[str] = []
+    for b in blocks:
+        for seg in _re.findall(r"[\u4e00-\u9fff]+", b):
+            if len(seg) <= 8:  # 常规长度的专业词整体保留
+                tokens.append(seg)
+            else:
+                # 超长词才拆分（兜底），并保留原词
+                grams = [seg[i : i + 2] for i in range(len(seg) - 1)]
+                seen, kept = set(), []
+                for g in grams:
+                    if g not in seen:
+                        seen.add(g)
+                        kept.append(g)
+                tokens.append(seg)
+                tokens.extend(kept[:2])
+
+    # 2) 去重保序 + 剔除过泛词
+    generic = {"工艺", "研究", "应用", "分析", "技术", "方法", "实验", "效果", "研究进展"}
+    seen, tks = set(), []
+    for t in tokens:
+        if t and t not in seen and t not in generic:
+            seen.add(t)
+            tks.append(t)
+    tks = tks[:4]
+
+    if len(tks) >= 2:
+        # 多词块：用「与」连接（各自作为主题条件）
+        expr = "SU=(" + " * ".join(f"'{t}'" for t in tks) + ")"
+    elif tks:
+        # 单一长词块：叠加「篇关摘」模糊检索，提升召回
+        # （实测 SU 整体词召回偏少，TKA 更宽松）
+        expr = f"SU='{tks[0]}' or TKA='{tks[0]}'"
+    else:
+        expr = f"SU='{topic}'"
+    if journal:
+        expr += f" and LY='{journal}'"
+    return expr
 
 
 def search_cnki(query: str, limit: int = 15) -> str:
@@ -166,3 +232,12 @@ def search_cnki_core_journal(query: str, journal: str, limit: int = 10) -> str:
     """
     combined = f"({query}) and LY='{journal}'"
     return search_cnki(combined, limit=limit)
+
+# ---------- CrewAI 工具包装 ----------
+# 延迟导入 crewai，保证在无 crewai 环境下本模块仍可被 main.py 使用
+try:
+    from crewai.tools import tool as _crew_tool
+
+    cnki_search = _crew_tool("知网中文文献检索")(search_cnki)
+except Exception:  # noqa: BLE001
+    cnki_search = None

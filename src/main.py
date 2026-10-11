@@ -31,6 +31,7 @@ from src.crews.market_crew import build_market_crew
 from src.tools.literature_tool import literature_search, search_literature
 from src.tools.openalex_tool import openalex_search, search_openalex
 from src.tools.crossref_tool import crossref_search, search_crossref
+from src.tools.cnki_tool import cnki_search, search_cnki, build_advanced_query
 from src.tools.core_journals import CORE_JOURNALS, CORE_JOURNAL_GROUPS
 
 
@@ -48,6 +49,20 @@ def _norm_venue(s: str) -> str:
 
 
 _NORM_CORE = {_norm_venue(j) for j in CORE_JOURNALS}
+
+# 学位论文类特征词：知网返回的学位论文没有期刊名，`journal` 字段是
+# **学位授予单位**（如「西安理工大学」「哈尔滨工业大学」）。
+# 这些不是期刊，不能拿期刊白名单去匹配，但学位论文本身质量可靠
+# （尤其硕博论文对环境工程选题价值很高），应当保留并标注类型。
+_THESIS_MARKERS = (
+    "大学", "学院", "研究院", "研究所", "科学院",
+)
+
+
+def _is_thesis(venue: str) -> bool:
+    """判断是否为学位论文记录（venue 实为学位授予单位）。"""
+    v = (venue or "").strip()
+    return any(m in v for m in _THESIS_MARKERS)
 
 
 def _is_core_journal(venue: str) -> bool:
@@ -95,8 +110,13 @@ def assess_quality(papers, topic=""):
         lang = p.get("lang", "en")
         venue = p.get("venue") or ""
 
-        # 中文文献：白名单是唯一判据
+        # 中文文献：以白名单为唯一判据
         if lang == "zh":
+            # 学位论文：venue 是学位授予单位，非期刊，不适用期刊白名单。
+            # 硕博论文对环境工程选题价值高，保留并在报告中标注类型。
+            if _is_thesis(venue):
+                kept.append(p)
+                continue
             if not _is_core_journal(venue):
                 dropped.append((p, f"非北大核心期刊（{venue or '未标注'}）"))
                 continue
@@ -189,8 +209,11 @@ def parse_ss_papers(raw: str):
         lang = "?"
         if len(parts) >= 6:
             lang = parts[5].replace("语言:", "", 1).strip()
-        if not doi or doi == "N/A":
+        if not title:
             continue
+        # 注意：中文期刊论文常无 DOI（知网 CLI 返回即如此），
+        # 不能因缺 DOI 而丢弃——标题/期刊/年份齐备即为可溯源记录。
+        doi = "" if doi in ("N/A", "?") else doi
         # 语种最终以标题实际字符判定：数据源的 language 字段不可靠
         # （OpenAlex 实测会把中文期刊标成 en），字符判定最稳。
         cjk = sum(1 for ch in title if "\u4e00" <= ch <= "\u9fff")
@@ -250,6 +273,25 @@ def append_grounded_refs(report_path: str, block: str):
         f.write(content)
 
 
+def _chinese_portion(topic: str) -> str:
+    """从混合检索词中提取中文部分（知网只对中文查询有意义）。
+
+    「城镇污水处理 side-stream EBPR」→ 「城镇污水处理」
+    无中文时返回空字符串，表示不走知网。
+    """
+    cn = re.findall(r"[\u4e00-\u9fff]+", topic or "")
+    return " ".join(cn).strip()
+
+
+def _english_portion(topic: str) -> str:
+    """提取检索词中的英文部分（供英文学术库使用）。
+
+    纯中文主题不查英文库——实测中文词会被英文库按模糊匹配返回
+    完全无关的内容（如"水母幼虫""飞溅侵蚀"）。
+    """
+    return " ".join(re.findall(r"[A-Za-z][A-Za-z\-]*", topic or "")).strip()
+
+
 def fetch_literature_grounded(topic: str, limit: int = 15):
     """多源容错抓取真实文献：Semantic Scholar → OpenAlex → Crossref。
 
@@ -263,30 +305,47 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
     used_sources = []
     errors = []
 
-    # 依次尝试三个真实学术源，合并去重后统一做中英文均衡。
-    # 不做提前停止：某源可能只返回单一语种（如中文词命中中文刊），
-    # 提前停止会漏掉另一语种的优质文献。
-    for name, fn in (
-        ("Semantic Scholar", search_literature),
-        ("OpenAlex", search_openalex),
-        ("Crossref", search_crossref),
-    ):
-        raw = fn(topic, limit)
-        papers = parse_ss_papers(raw)
-        # **Crossref 的中文库基本是灌水刊集散地**，只取其英文记录，
-        # 中文文献交由 OpenAlex（收录更严谨且有 language 字段）负责。
-        if name == "Crossref":
-            en_only = [p for p in papers if p["lang"] != "zh"]
-            zh_dropped = len(papers) - len(en_only)
-            papers = en_only
-            if zh_dropped:
-                errors.append(
-                    f"- **Crossref**：已跳过 {zh_dropped} 条中文记录"
-                    f"（该库中文部分以付费灌水刊为主，质量不可信）"
-                )
-        if papers:
-            collected.extend(papers)
-            used_sources.append(name)
+    # 【中文主源】知网 —— 中文核心刊的唯一可靠来源。
+    # 检索词含中文时走知网（开放库的中文部分以付费灌水刊为主）。
+    # 用普通主题词先广召回，再由 assess_quality 按北大核心白名单过滤；
+    # 不做 LY 期刊限定——单期刊召回过少，反而漏掉其它核心刊成果。
+    zh_query = _chinese_portion(topic)
+    if zh_query:
+        raw_cnki = search_cnki(build_advanced_query(zh_query), limit)
+        papers_cnki = [p for p in parse_ss_papers(raw_cnki) if p["lang"] == "zh"]
+        if papers_cnki:
+            collected.extend(papers_cnki)
+            used_sources.append("知网")
+        else:
+            errors.append(f"- **知网**：{(raw_cnki or '').strip()[:160]}")
+
+    # 【英文源】仅当检索词含英文时才查。
+    # 纯中文词喂给英文库会按模糊匹配返回完全无关的内容
+    # （实测"侧流生物除磷"→ Crossref 返回"水母幼虫""飞溅侵蚀"），
+    # 故此场景只走知网，避免污染结果。
+    en_query = _english_portion(topic)
+    if en_query:
+        for name, fn in (
+            ("Semantic Scholar", search_literature),
+            ("OpenAlex", search_openalex),
+            ("Crossref", search_crossref),
+        ):
+            raw = fn(en_query, limit)
+            papers = parse_ss_papers(raw)
+            # **Crossref 的中文库基本是灌水刊集散地**，只取其英文记录，
+            # 中文文献交由知网负责。
+            if name == "Crossref":
+                en_only = [p for p in papers if p["lang"] != "zh"]
+                zh_dropped = len(papers) - len(en_only)
+                papers = en_only
+                if zh_dropped:
+                    errors.append(
+                        f"- **Crossref**：已跳过 {zh_dropped} 条中文记录"
+                        f"（该库中文部分以付费灌水刊为主，质量不可信）"
+                    )
+            if papers:
+                collected.extend(papers)
+                used_sources.append(name)
 
     if not collected:
         fail_msg = (
@@ -296,36 +355,43 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
         )
         return fail_msg, "无（三个源均失败）", [], None
 
-    # 去重（按 DOI）
+    # 去重：有 DOI 用 DOI 作键；中文文献常无 DOI，退化为「标题+年份」去重
     seen = set()
     uniq = []
     for p in collected:
-        k = p["doi"].lower()
+        k = p["doi"].lower() if p.get("doi") else f"{p['title'].strip().lower()}|{p.get('year','')}"
         if k not in seen:
             seen.add(k)
             uniq.append(p)
 
-    # 中英文均衡：中文库通常返回较少，按比例补足
-    zh = [p for p in uniq if p["lang"] == "zh"]
-    en = [p for p in uniq if p["lang"] != "zh"]
+    # 先做质量过滤，再做中英文均衡——
+    # 顺序很重要：若先均衡再过滤，中文配额会被不合格记录占掉，
+    # 导致「知网明明拿到核心刊、最终却一篇不剩」。
+    kept, warn = assess_quality(uniq, topic)
+
+    zh = [p for p in kept if p["lang"] == "zh"]
+    en = [p for p in kept if p["lang"] != "zh"]
+
+    # 中文至少保留 1/3（最低 2 篇），其余留给英文
     balanced = []
     if zh and en:
-        take_zh = min(len(zh), max(limit // 3, 1))
+        take_zh = min(len(zh), max(limit // 3, 2))
         take_en = min(len(en), limit - take_zh)
         balanced = zh[:take_zh] + en[:take_en]
     elif zh:
-        # 只有中文可用：全量中文，并提示可补英文词以获得英文文献
         balanced = zh[:limit]
     else:
         balanced = en[:limit]
 
-    kept, warn = assess_quality(balanced, topic)
-
     # 重建注入给 Crew 的上下文文本
     lines = [f"# 真实检索结果（来源：{'/'.join(used_sources)}，严禁编造、严禁替换）"]
     for p in kept:
+        # 知网记录的 venue 字段可能是期刊名，也可能是学位授予单位
+        kind = ""
+        if p.get("lang") == "zh" and _is_thesis(p.get("venue", "")):
+            kind = "（类型：学位论文，授予单位）"
         lines.append(
-            f"- {p['title']} ({p['year']}) | {p['authors']} | {p['venue']} | "
+            f"- {p['title']} ({p['year']}) | {p['authors']} | {p['venue']}{kind} | "
             f"DOI:{p['doi']} | 被引:{p['citations']} | 语言:{p['lang']}"
         )
     raw_ctx = "\n".join(lines)
