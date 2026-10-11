@@ -29,6 +29,8 @@ from crewai import LLM
 from src.crews.literature_crew import build_literature_crew
 from src.crews.market_crew import build_market_crew
 from src.tools.literature_tool import literature_search, search_literature
+from src.tools.openalex_tool import openalex_search, search_openalex
+from src.tools.crossref_tool import crossref_search, search_crossref
 from src.tools.web_tool import web_search, search_web
 
 
@@ -118,6 +120,36 @@ def append_grounded_refs(report_path: str, block: str):
         f.write(content)
 
 
+def fetch_literature_grounded(topic: str, limit: int = 15):
+    """多源容错抓取真实文献：Semantic Scholar → OpenAlex → Crossref 依次回退。
+
+    三个源均返回真实可溯源的学术记录。这是「可溯源铁律」的基准数据：
+    由代码直接调用真实学术库获取，LLM 不参与。全部失败时如实返回空，
+    由报告告知用户原因，绝不编造。
+    """
+    attempts = []
+    # 依次尝试三个真实学术源
+    for name, fn in (
+        ("Semantic Scholar", search_literature),
+        ("OpenAlex", search_openalex),
+        ("Crossref", search_crossref),
+    ):
+        raw = fn(topic, limit)
+        papers = parse_ss_papers(raw)  # 三源输出格式一致，复用解析器
+        if papers:
+            return raw, name, papers
+        attempts.append(f"- **{name}**：{raw.strip()[:200]}")
+
+    # 三源都失败：如实返回失败信息（报告会转述，绝不编造）
+    fail_msg = (
+        "经依次尝试，以下检索渠道均未返回可用结果：\n"
+        + "\n".join(attempts)
+        + "\n\n建议：稍后重试；或配置 SEMANTIC_SCHOLAR_API_KEY 提升速率；"
+        "或缩短检索关键词。"
+    )
+    return fail_msg, "无（三个源均失败）", []
+
+
 def main():
     parser = argparse.ArgumentParser(description="学术前期研究 Agent（论文检索 / 市场调研）")
     parser.add_argument(
@@ -130,13 +162,12 @@ def main():
     args = parser.parse_args()
 
     llm = get_llm()
-    tools = [literature_search, web_search]
+    tools = [literature_search, openalex_search, crossref_search, web_search]
     os.makedirs("reports", exist_ok=True)
 
     if args.mode == "literature":
         # 1) 真实检索：可溯源铁律的基准数据（由代码持有，LLM 不碰）
-        raw = search_literature(args.topic, 15)
-        papers = parse_ss_papers(raw)
+        raw, source, papers = fetch_literature_grounded(args.topic, 15)
         ref_tsv = os.path.join("reports", "literature_references.tsv")
         tsv_lines = ["标题\t年份\t作者\tDOI\t期刊\t被引"]
         for p in papers:
@@ -154,7 +185,10 @@ def main():
             + "\n```"
         )
         append_grounded_refs(report_path, tsv_block)
-        print(f"\n===== 完成：报告={report_path}，真实文献 {len(papers)} 篇，TSV={ref_tsv} =====\n")
+        print(
+            f"\n===== 完成：报告={report_path}，真实文献 {len(papers)} 篇"
+            f"（来源：{source}），TSV={ref_tsv} =====\n"
+        )
 
     else:  # market
         raw = search_web(args.topic, 8)
