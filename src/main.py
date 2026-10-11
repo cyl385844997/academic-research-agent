@@ -32,7 +32,7 @@ from src.tools.literature_tool import literature_search, search_literature
 from src.tools.openalex_tool import openalex_search, search_openalex
 from src.tools.crossref_tool import crossref_search, search_crossref
 from src.tools.cnki_tool import cnki_search, search_cnki, build_advanced_query
-from src.tools.query_translator import translate_to_english_queries
+from src.tools.query_translator import understand_topic, translate_to_english_queries
 from src.tools.core_journals import CORE_JOURNALS, CORE_JOURNAL_GROUPS
 
 
@@ -291,6 +291,50 @@ def _chinese_portion(topic: str) -> str:
     return " ".join(cn).strip()
 
 
+def _resolve_topic(topic: str) -> dict:
+    """理解检索主题，产出中英文检索式（含来源与解释）。
+
+    三层：领域词典 → LLM 概念解析 → 规则回退。
+    返回结构供fetch_literature_grounded 使用与写入报告，保证可溯源。
+    """
+    zh = _chinese_portion(topic)
+    # 原词已含英文时直接用，不做翻译
+    en_in_topic = " ".join(re.findall(r"[A-Za-z][A-Za-z\-]*", topic or "")).strip()
+
+    understanding = None
+    if zh:
+        understanding = understand_topic(zh)
+
+    cnki_query = ""
+    en_queries = []
+    source = "未解析"
+    explanation = ""
+    concept = {}
+    if understanding:
+        cnki_query = understanding.get("cnki_query") or ""
+        en_queries = understanding.get("english_queries") or []
+        source = understanding.get("source") or "未解析"
+        explanation = understanding.get("explanation") or ""
+        concept = understanding.get("concept") or {}
+
+    # 规则回退：词典与 LLM 都未给出可用检索式时，用切词规则兜底
+    if zh and not cnki_query:
+        from src.tools.cnki_tool import build_advanced_query
+        cnki_query = build_advanced_query(zh)
+        source = "规则回退（词典/LLM 未产出）"
+    if en_in_topic:
+        en_queries = [en_in_topic] + [q for q in en_queries if q != en_in_topic]
+
+    return {
+        "zh_query": zh,
+        "cnki_query": cnki_query,
+        "english_queries": en_queries[:2],
+        "source": source,
+        "explanation": explanation,
+        "concept": concept,
+    }
+
+
 def _english_queries(topic: str, max_queries: int = 2) -> list[str]:
     """生成用于英文库检索的检索式列表。
 
@@ -307,6 +351,47 @@ def _english_queries(topic: str, max_queries: int = 2) -> list[str]:
     return []
 
 
+def _search_cnki_with_fallback(understanding: dict, limit: int):
+    """知网检索 + 0 命中自动降级重试。
+
+    降级阶梯（由严到宽）：
+        1. 解析出的完整检索式（对象 * (条件 + 任务)）
+        2. 去掉全部修饰词（仅对象）
+        3. 整词 TKA 兜底
+        4. 整词 SU 兜底
+    只要任一阶梯召回>0 即停止。返回 (papers, trace)，
+    trace 记录每级尝试与结果，写入报告以保证可溯源。
+    """
+    primary = understanding.get("cnki_query") or ""
+    zh = understanding.get("zh_query") or ""
+    concept = understanding.get("concept") or {}
+    objs = concept.get("对象") or []
+
+    ladder = []
+    if primary:
+        ladder.append(("完整式", primary))
+    # 仅对象词
+    obj = objs[0] if objs else (zh.split()[0] if zh else "")
+    if obj:
+        ladder.append(("仅对象词", f"SU='{obj}' or TKA='{obj}'"))
+    if zh:
+        ladder.append(("整词篇关摘", f"TKA='{zh}'"))
+        ladder.append(("整词主题", f"SU='{zh}'"))
+
+    papers, trace = [], []
+    for label, query in ladder:
+        raw = search_cnki(query, limit)
+        got = [x for x in parse_ss_papers(raw) if x["lang"] == "zh"]
+        trace.append(f"{label} `{query}` → {len(got)} 篇")
+        if got:
+            papers = got
+            break
+    return papers, trace
+
+
+_LAST_TRACE = []
+
+
 def fetch_literature_grounded(topic: str, limit: int = 15):
     """多源容错抓取真实文献：知网（中文）+ Semantic Scholar/OpenAlex/Crossref（英文）。
 
@@ -320,27 +405,47 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
 
 返回 (raw_text, source_name, papers, warn)。
     """
+    global _LAST_TRACE
     collected = []
     used_sources = []
     errors = []
 
+    # 【主题理解】三层架构：领域词典 → LLM 概念解析 → 规则回退
+    u = _resolve_topic(topic)
+    trace_lines = [
+        f"- 检索主题理解（来源：{u['source']}）",
+    ]
+    if u["concept"]:
+        c = u["concept"]
+        trace_lines.append(
+            f"  - 语义拆解：对象={c.get('对象') or '—'}｜条件={c.get('条件') or '—'}｜任务={c.get('任务') or '—'}"
+        )
+    if u["explanation"]:
+        trace_lines.append(f"  - 说明：{u['explanation']}")
+    if u["cnki_query"]:
+        trace_lines.append(f"  - 知网检索式：`{u['cnki_query']}`")
+
     # 【中文主源】知网 —— 中文核心刊的唯一可靠来源。
-    # 用专业检索式广召回，再由 assess_quality 按北大核心白名单过滤；
-    # 不做 LY 期刊限定——单期刊召回过少，反而漏掉其它核心刊成果。
-    zh_query = _chinese_portion(topic)
+    # 0 命中时按阶梯自动降级重试（去修饰 → 仅对象 → 整词 TKA），
+    # 避免因检索式过严而误判"无文献"。
+    zh_query = u["zh_query"]
     if zh_query:
-        raw_cnki = search_cnki(build_advanced_query(zh_query), limit)
-        papers_cnki = [p for p in parse_ss_papers(raw_cnki) if p["lang"] == "zh"]
+        papers_cnki, cnki_trace = _search_cnki_with_fallback(u, limit)
+        trace_lines.append(f"  - 知网召回：{len(papers_cnki)} 篇")
+        trace_lines.extend(f"    {t}" for t in cnki_trace)
         if papers_cnki:
             collected.extend(papers_cnki)
             used_sources.append("知网")
         else:
-            errors.append(f"- **知网**：{(raw_cnki or '').strip()[:160]}")
+            errors.append("- **知网**：各降级阶梯均无结果")
+
+    if u["english_queries"]:
+        trace_lines.append("  - 英文检索式：" + "；".join(f"`{q}`" for q in u["english_queries"]))
 
     # 【英文源】英文检索式来源：
     #   - 原词含英文 → 直接使用；
     #   - 纯中文 → LLM 转成国际期刊通用术语（避免中文词污染英文库）。
-    en_queries = _english_queries(topic)
+    en_queries = u["english_queries"]
     if not en_queries and zh_query:
         errors.append(
             "- **英文检索**：未能从中文主题生成英文检索式（LLM 不可用），"
@@ -375,6 +480,7 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
             + "\n".join(errors)
             + "\n\n建议：稍后重试；或配置 SEMANTIC_SCHOLAR_API_KEY 提升速率；或缩短检索关键词。"
         )
+        _LAST_TRACE = trace_lines
         return fail_msg, "无（三个源均失败）", [], None
 
     # 去重：有 DOI 用 DOI 作键；中文文献常无 DOI，退化为「标题+年份」去重
@@ -390,6 +496,7 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
     # 顺序很重要：若先均衡再过滤，中文配额会被不合格记录占掉，
     # 导致「知网明明拿到核心刊、最终却一篇不剩」。
     kept, warn = assess_quality(uniq, topic, en_topic=" ".join(en_queries))
+    _LAST_TRACE = trace_lines  # 保存溯源信息供报告使用
 
     zh = [p for p in kept if p["lang"] == "zh"]
     en = [p for p in kept if p["lang"] != "zh"]
@@ -467,7 +574,13 @@ def main():
         # 3) 后处理：剥离可能伪造的 TSV，追加真实 TSV
         print("[3/3] 正在生成报告...")
         report_path = os.path.join("reports", "literature_report.md")
+        from src.main import _LAST_TRACE
+        trace_md = "\n".join(_LAST_TRACE) if _LAST_TRACE else "（无溯源记录）"
         tsv_block = (
+            "## 检索过程溯源\n\n"
+            "本节记录程序如何理解你的检索主题、构造了哪些检索式、各级降级结果——"
+            "**若理解有误，可据此判断并换词重跑**。\n\n"
+            f"{trace_md}\n\n"
             "## 文献表（真实检索结果，系统按代码生成，绝不编造）\n\n"
             f"来源：{source}｜中文 {n_zh} 篇 + 英文 {n_en} 篇\n\n```\n"
             + "\n".join(tsv_lines)
