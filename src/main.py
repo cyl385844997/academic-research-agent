@@ -10,6 +10,7 @@
 """
 import os
 import re
+import time
 import sys
 import argparse
 
@@ -34,6 +35,12 @@ from src.tools.crossref_tool import crossref_search, search_crossref
 from src.tools.cnki_tool import cnki_search, search_cnki, build_advanced_query
 from src.tools.query_translator import understand_topic, translate_to_english_queries
 from src.tools.core_journals import CORE_JOURNALS, CORE_JOURNAL_GROUPS
+from src.tools.market_query import DIMENSIONS, build_market_queries
+from src.tools.source_credibility import (
+    build_market_table,
+    classify_source,
+    dedupe_records,
+)
 
 
 def _norm_venue(s: str) -> str:
@@ -593,24 +600,91 @@ def main():
         )
 
     else:  # market
-        raw = search_web(args.topic, 8)
-        items = parse_web_results(raw)
+        # 【市场调研】与文献检索的差异：
+        #   检索词 → 多维拆解（产品/厂商/技术/案例，中英文分列）
+        #   质量判据 → 来源可信度分级（A/B/C，D级丢弃），无期刊白名单
+        print("[1/3] 正在拆解调研主题为多维检索式...")
+        mq = build_market_queries(args.topic, max_queries=5)
+        queries = mq["queries"]
+        trace = [f"- 题型判定：{mq['题型']}（检索式来源：{mq['source']}）"]
+        for q in queries:
+            flag = " ⚠需核实产品名" if q.get("需核实") else ""
+            trace.append(f"  - [{DIMENSIONS.get(q['维度'], q['维度'])}] `{q['查询']}`{flag}")
+        if not queries:
+            print("⚠️ 未能生成可用检索式，请调整主题表述")
+
+        print(f"[2/3] 正在执行 {len(queries)} 条检索式并评估来源可信度...")
+        records = []
+        for q in queries:
+            raw_i = search_web(q["查询"], 6)
+            for it in parse_web_results(raw_i):
+                tier = classify_source(it["url"], it["title"], it["snippet"])
+                if tier == "D":
+                    continue  # 内容农场直接丢弃
+                records.append({
+                    "title": it["title"],
+                    "url": it["url"],
+                    "snippet": it["snippet"],
+                    "tier": tier,
+                    "query_hit": f"{DIMENSIONS.get(q['维度'], q['维度'])}: {q['查询']}",
+                })
+            time.sleep(0.5)  # 降低被限流概率
+        records = dedupe_records(records)
+
         ref_tsv = os.path.join("reports", "market_references.tsv")
-        tsv_lines = ["标题\tURL\t摘要"]
-        for it in items:
-            tsv_lines.append(f"{it['title']}\t{it['url']}\t{it['snippet']}")
+        table_rows = build_market_table(records)
+        tsv_lines = ["\t".join(r) for r in table_rows]
         with open(ref_tsv, "w", encoding="utf-8") as f:
             f.write("\n".join(tsv_lines) + "\n")
-        crew = build_market_crew(args.topic, llm, tools, search_results=raw)
+
+        tier_stat = {}
+        for r in records:
+            tier_stat[r["tier"]] = tier_stat.get(r["tier"], 0) + 1
+        trace.append(
+            f"  - 来源分级：" + "；".join(f"{t}级 {n} 条" for t, n in sorted(tier_stat.items()))
+            + f"（D级内容农场已丢弃）"
+        )
+
+        # 注入给 Crew 的上下文：含可信度标记，提示分析员区分对待
+        ctx_lines = [
+            "# 真实检索结果（来源含可信度分级，严禁编造产品名/链接）",
+            "",
+            "| 产品/机构候选 | 来源标题 | 可信度 | 功能线索 | 命中检索式 |",
+            "|---|---|---|---|---|",
+        ]
+        for row in table_rows[1:]:
+            ctx_lines.append("| " + " | ".join(row[:1] + row[1:2] + row[3:]) + " |")
+        ctx_lines.append("")
+        ctx_lines.append(
+            "【重要】可信度 A=官方/学术，B=主流媒体，C=社区参考。"
+            "撰写时须区分：只有 A/B 级可作为结论依据，C 级需注明「社区反馈，待核实」。"
+            "产品名均为**从检索结果抽取的候选**，未经核实，不得断言。"
+        )
+        market_ctx = "\n".join(ctx_lines)
+
+        print("[3/3] 正在运行 CrewAI 三角色分析...")
+        crew = build_market_crew(args.topic, llm, tools, search_results=market_ctx)
         crew.kickoff()
+
         report_path = os.path.join("reports", "market_report.md")
+        trace_md = "\n".join(trace)
         tsv_block = (
-            "## 来源链接表（真实检索结果，系统自动生成，绝不编造）\n\n```\n"
-            + "\n".join(tsv_lines)
-            + "\n```"
+            "## 检索过程溯源\n\n"
+            "本节记录调研主题如何被拆解为多维检索式、各来源的可信度分布——"
+            "**若拆解有误，可据此判断并换词重跑**。\n\n"
+            f"{trace_md}\n\n"
+            "## 产品/机构对比表（由真实检索结果经代码生成，绝不编造）\n\n"
+            "列：产品/机构｜来源标题｜URL｜可信度｜功能线索｜命中检索式\n\n"
+            "```\n" + "\n".join(tsv_lines) + "\n```\n\n"
+            "> 产品/机构名为**从标题与 URL 抽取的候选**，非经核实；\n"
+            "> 可信度 C 的来源属社区反馈，仅供参考。"
         )
         append_grounded_refs(report_path, tsv_block)
-        print(f"\n===== 完成：报告={report_path}，真实来源 {len(items)} 条，TSV={ref_tsv} =====\n")
+        print(
+            f"\n===== 完成：报告={report_path}，真实来源 {len(records)} 条"
+            f"（A{tier_stat.get('A',0)}/B{tier_stat.get('B',0)}/C{tier_stat.get('C',0)}），"
+            f"TSV={ref_tsv} =====\n"
+        )
 
 
 if __name__ == "__main__":
