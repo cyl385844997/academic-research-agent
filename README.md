@@ -84,15 +84,41 @@
 | 论文检索 | `--mode literature` | 检索员→分析员→撰稿员 三角色，产出文献综述报告 + TSV 文献表（含真实 DOI） |
 | 市场调研 | `--mode market` | 侦察员→分析员→撰稿员 三角色，产出市场 / 竞品格局分析报告 |
 
-**文献数据源三级容错**（均免 key，任一成功即用）：
+### 四级文献源（中英文并行）
 
-| 顺序 | 数据源 | 说明 |
-|:---:|---|---|
-| 1 | Semantic Scholar | 覆盖 2 亿+ 论文，主力源 |
-| 2 | OpenAlex | S2 限流(429)时回退 |
-| 3 | Crossref | DOI 注册库，已过滤审稿意见等非论文记录 |
+```
+中文 → 知网（专业检索式 + 北大核心白名单）
+英文 → Semantic Scholar → OpenAlex → Crossref（自动容错）
+```
 
-三者均失败时**如实报告失败原因并给出建议，绝不编造文献**。
+**输入中文即可**：程序会用 LLM 把中文主题转换为国际期刊通用术语的英文检索式，
+与中文检索并行执行。例如「侧流生物除磷」自动转成
+`(sidestream OR side-stream) AND ("biological phosphorus removal" OR EBPR)`。
+
+> ⚠️ LLM 生成的检索式会经过幻觉词校验（曾出现 `"leisure level"` 这类臆造词，
+> 导致召回大量无关文献）。检索结果再经主题相关性过滤。
+
+**文献源均无需 API key**（知网需已安装 [cnki-mcp](https://github.com/SepineTam/cnki-mcp) 并完成登录初始化）。
+
+---
+
+## 快速开始
+
+```bash
+# 1) 安装（建议 Python 3.10 ~ 3.12）
+python -m venv .venv && .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+
+# 2) 中文检索需额外准备 cnki-mcp（一次性）
+git clone https://github.com/SepineTam/cnki-mcp.git
+cd cnki-mcp && uv sync && uv run playwright install chromium
+uv run cnki-mcp init      # 浏览器内完成知网认证
+
+# 3) 运行
+cd ..
+python src/main.py --mode literature --topic "侧流生物除磷"
+```
 
 ## 安装
 
