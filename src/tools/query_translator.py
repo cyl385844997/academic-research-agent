@@ -22,8 +22,10 @@ _PROMPT_TEMPLATE = """你是环境工程/污水处理领域的文献检索专家
 要求：
 1. 输出 2-3 个英文检索式，用分号分隔
 2. 必须使用该领域的国际通用术语（专业术语，不是逐字直译）
-3. 每个检索式 3-8 个关键词
-4. 只输出检索式本身，不要任何解释
+3. 只使用**该领域论文标题中真实出现过**的词，不要生造复合词
+4. 避免使用罕见或只在非学术语境出现的词；宁可用宽泛的常用术语
+5. 每个检索式 3-8 个关键词
+6. 只输出检索式本身，不要任何解释
 
 中文主题：{topic}
 英文检索式："""
@@ -50,17 +52,39 @@ def _get_llm():
     return ChatOpenAI(**kwargs)
 
 
+# 翻译质量闸门：出现以下情形视为幻觉，整条检索式丢弃
+_HALLUCINATION_MARKERS = (
+    "leisure",          # 「高水位」误译为 leisure level（休闲水位）
+    "sanitarium",
+    "fun",              # 「溢流/溢水」误译
+    "drainage basin recreational",
+)
+
+
 def _clean_queries(text: str, topic: str) -> list[str]:
-    """从 LLM 输出中清洗出干净的检索式列表。"""
+    """从 LLM 输出中清洗出干净的检索式列表。
+
+    质量闸门（实测教训）：LLM 偶发产出臆造词，如把「高水位」译成
+    `"leisure level"`。这类检索式丢给 Crossref 会召回大量无关文献
+    （实测召回洪水/钩端螺旋体病等传染病学文献）。故：
+      - 命中臆造词黑名单 → 整条丢弃；
+      - 纯中文/含中文 → 丢弃；
+      - 检索式过短（<2 个有效词）→ 丢弃。
+    """
     out = []
     for seg in re.split(r"[;；\n]", text or ""):
         q = seg.strip().strip("-*").strip()
-        if not q or len(q) < 3:
+        if not q or len(q) < 8:
             continue
-        # 必须含英文词，纯中文/标点丢弃
-        if not re.search(r"[A-Za-z]{3,}", q):
+        low = q.lower()
+        # 臆造词闸门
+        if any(m in low for m in _HALLUCINATION_MARKERS):
             continue
-        # 剔除幻觉：不得包含原中文主题
+        # 必须含足量英文词
+        words = re.findall(r"[A-Za-z]{3,}", q)
+        if len(words) < 2:
+            continue
+        # 不得含中文
         if re.search(r"[\u4e00-\u9fff]", q):
             continue
         out.append(q)

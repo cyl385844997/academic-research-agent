@@ -77,7 +77,7 @@ def _is_core_journal(venue: str) -> bool:
     return any(v.startswith(j) or j.startswith(v) for j in _NORM_CORE if len(j) >= 4)
 
 
-def assess_quality(papers, topic=""):
+def assess_quality(papers, topic="", en_topic=""):
     """对检索结果做质量评估，返回 (过滤后列表, 预警信息或None)。
 
     **中文文献的唯一判据是北大核心期刊白名单**（见 tools/core_journals.py，
@@ -95,6 +95,10 @@ def assess_quality(papers, topic=""):
         return set(re.findall(r"[\u4e00-\u9fff]{2,}", s)), set(re.findall(r"[a-z]{3,}", s))
 
     topic_cn, topic_en = tokens(topic)
+    # 实际用于英文检索的词（可能是 LLM 翻译所得），用于英文相关性判断
+    _, en_topic_words = tokens(en_topic)
+    if en_topic:
+        en_topic_words = set(re.findall(r"[a-z]{3,}", en_topic.lower()))
 
     def relevant(title: str, lang: str) -> bool:
         """判断标题是否与检索词相关。
@@ -128,8 +132,11 @@ def assess_quality(papers, topic=""):
             kept.append(p)
             continue
 
-        # 英文文献：只做主题相关性过滤
-        if topic_en and not (topic_en & tokens(p.get("title", ""))[1]):
+        # 英文文献：按「实际使用的英文检索词」做相关性过滤。
+        # 注意不能用 topic 的英文部分——纯中文输入时它为空，
+        # 会导致相关性检查被整体跳过，LLM 翻译偏差引入的噪声文献
+        # （实测召回洪水/传染病学文献）全部放行。
+        if en_topic_words and not (en_topic_words & tokens(p.get("title", ""))[1]):
             dropped.append((p, "主题不相关"))
             continue
         kept.append(p)
@@ -382,7 +389,7 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
     # 先做质量过滤，再做中英文均衡——
     # 顺序很重要：若先均衡再过滤，中文配额会被不合格记录占掉，
     # 导致「知网明明拿到核心刊、最终却一篇不剩」。
-    kept, warn = assess_quality(uniq, topic)
+    kept, warn = assess_quality(uniq, topic, en_topic=" ".join(en_queries))
 
     zh = [p for p in kept if p["lang"] == "zh"]
     en = [p for p in kept if p["lang"] != "zh"]
