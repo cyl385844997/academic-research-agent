@@ -53,8 +53,12 @@ def search_openalex(query: str, limit: int = 15) -> str:
         if not doi:
             doi = "N/A"
         cited = w.get("cited_by_count", "?")
+        # 语种以标题实际字符判定，不依赖 OpenAlex 的 language 字段——
+        # 实测该字段不可靠，会把中文期刊标成 en。
+        cjk = sum(1 for ch in title if "\u4e00" <= ch <= "\u9fff")
+        lang = "zh" if cjk >= 3 else (w.get("language") or "en")
         lines.append(
-            f"- {title} ({year}) | {authors} | {venue} | DOI:{doi} | 被引:{cited}"
+            f"- {title} ({year}) | {authors} | {venue} | DOI:{doi} | 被引:{cited} | 语言:{lang}"
         )
     header = f"# OpenAlex 检索结果（query='{query}', 共 {len(works)} 篇）\n"
     return header + "\n".join(lines)
