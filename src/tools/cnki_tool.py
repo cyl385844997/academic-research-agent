@@ -61,6 +61,66 @@ def _run_cli(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
         return 1, "", f"知网检索异常：{exc}"
 
 
+# 领域常见术语尾段：长主题词按这些词切出核心术语 + 方法词。
+# 用于「高水位排水管网诊断」→「排水管网」+「高水位」+「诊断」
+_TERM_TAILS = ("诊断", "检测", "评估", "评价", "监测", "排查", "修复", "运维", "管理")
+
+# 已知领域核心名词：长词里若含这些词，优先切出它们作主条件
+_DOMAIN_NOUNS = (
+    "排水管网", "排水管道", "污水管网", "给水管网", "管网", "管道",
+    "污水处理", "污水厂", "再生水", "除磷", "脱氮", "进水", "出水",
+    "合流制", "分流制", "溢流", "内涝", "泵站", "调蓄", "检测", "诊断",
+)
+
+
+def _split_compound(seg: str) -> list[str]:
+    """切分连续长词：优先切出领域核心名词，再保留修饰片段。
+
+    「高水位排水管网诊断」→「排水管网」+「高水位」+「诊断」
+    规则：
+      - 用**互不重叠**的核心名词（长的优先），避免「排水管网」与「管网」重复；
+      - 未被覆盖的修饰片段若含义不清（如「厂能耗优化」）则丢弃，不作检索条件；
+      - 至少保留整体词作为兜底，确保不因切分失误而完全丢结果。
+    """
+    if len(seg) <= 4:
+        return [seg]
+
+    # 按长度降序取核心名词，跳过已被更长名词覆盖的（避免「排水管网」+「管网」重复）
+    nouns = sorted(_DOMAIN_NOUNS, key=len, reverse=True)
+    covered = [False] * len(seg)
+    parts: list[str] = []
+    for noun in nouns:
+        idx = seg.find(noun)
+        if idx < 0:
+            continue
+        # 若该位置已被更长名词占用则跳过
+        if any(covered[idx : idx + len(noun)]):
+            continue
+        parts.append(noun)
+        for i in range(idx, idx + len(noun)):
+            covered[i] = True
+
+    # 未被覆盖的片段：仅保留 2-4 字的修饰片段（如「高水位」「城镇」），
+    # 过长且不成词的碎片直接丢弃
+    buf = ""
+    mods: list[str] = []
+    for i, ch in enumerate(seg):
+        if covered[i]:
+            if 2 <= len(buf) <= 4:
+                mods.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if 2 <= len(buf) <= 4:
+        mods.append(buf)
+
+    parts.extend(mods)
+    # 切分无效（只剩碎片或没切出名词）时返回整体词
+    if not parts or all(len(p) < 3 for p in parts):
+        return [seg]
+    return parts
+
+
 def build_advanced_query(topic: str, journal: str = "") -> str:
     """把普通中文主题词转换为知网专业检索式（显著提升召回质量）。
 
@@ -73,35 +133,39 @@ def build_advanced_query(topic: str, journal: str = "") -> str:
         LY=文献来源  DOI=DOI  CF=被引频次  AU=作者  AF=作者单位
         多词 `*`=与、`+`=或、`-`=非
 
-    切词原则：**不做机械滑窗切分**。实测 2-gram 滑窗会产出「流生」「物除」
-    这类跨词垃圾，导致检索式命中 0 篇。改为：
-      - 优先用空格/标点分隔的独立词块；
-      - 无分隔的长词直接整体作为主题词（知网 SU 支持长词组）；
-      - 只有当整体词过长（>8 字）且确需拆分时才用 2-gram 兜底。
+    切词原则（实测得出，重要）：
+      - **`*`=与 太苛刻，多词并列常导致 0 命中**。
+        实测「高水位排水管网诊断」：
+          `SU='高水位' * '排水管网'`                → 6 篇（但漏掉只讲诊断的）
+          `SU='排水管网' * ('高水位' + '诊断')`      → 6 篇且全部切题 ✓
+      - 主词用「与」`*`，可选修饰词用「或」`+`。
+      - 不做机械滑窗切分：2-gram 会产出「流生」「物除」跨词垃圾，导致 0 命中。
 
     Args:
-        topic: 中文主题词，如「侧流生物除磷」
+        topic: 中文主题词，如「高水位排水管网诊断」
         journal: 可选，限定期刊（配合北大核心白名单精准检索）
     """
     import re as _re
 
-    # 1) 先取空格/标点分隔的独立词块
+    # 1) 先按空格/标点分隔的独立词块
     blocks = [b for b in _re.split(r"[\s\-/、,，]+", topic or "") if b]
     tokens: list[str] = []
     for b in blocks:
         for seg in _re.findall(r"[\u4e00-\u9fff]+", b):
-            if len(seg) <= 8:  # 常规长度的专业词整体保留
+            if len(seg) <= 4:
                 tokens.append(seg)
+                continue
+            # 5 字及以上：先尝试按领域术语切分（「高水位排水管网诊断」→ 3 个词）
+            pieces = _split_compound(seg)
+            if len(pieces) >= 2:
+                tokens.extend(pieces)
             else:
-                # 超长词才拆分（兜底），并保留原词
-                grams = [seg[i : i + 2] for i in range(len(seg) - 1)]
-                seen, kept = set(), []
-                for g in grams:
-                    if g not in seen:
-                        seen.add(g)
-                        kept.append(g)
+                # 切不开则保留整体词
                 tokens.append(seg)
-                tokens.extend(kept[:2])
+            # 再补方法词尾段（诊断/检测/…），但排除已在 pieces 中的
+            for tail in _TERM_TAILS:
+                if seg.endswith(tail) and len(seg) > len(tail) + 2 and tail not in pieces:
+                    tokens.append(tail)
 
     # 2) 去重保序 + 剔除过泛词
     generic = {"工艺", "研究", "应用", "分析", "技术", "方法", "实验", "效果", "研究进展"}
@@ -110,17 +174,25 @@ def build_advanced_query(topic: str, journal: str = "") -> str:
         if t and t not in seen and t not in generic:
             seen.add(t)
             tks.append(t)
-    tks = tks[:4]
+    tks = tks[:5]
 
-    if len(tks) >= 2:
-        # 多词块：用「与」连接（各自作为主题条件）
-        expr = "SU=(" + " * ".join(f"'{t}'" for t in tks) + ")"
-    elif tks:
-        # 单一长词块：叠加「篇关摘」模糊检索，提升召回
-        # （实测 SU 整体词召回偏少，TKA 更宽松）
+    # 3) 组装检索式
+    #    策略：最长词（核心术语）作主条件，其余作「或」修饰——
+    #    `SU='主词' * ('修1' + '修2')` 表示「命中主词 且 命中任一修饰词」。
+    if not tks:
+        expr = f"SU='{topic}'"
+    elif len(tks) == 1:
         expr = f"SU='{tks[0]}' or TKA='{tks[0]}'"
     else:
-        expr = f"SU='{topic}'"
+        # 主词取「领域核心名词」，无匹配则取最长
+        main = next((t for t in tks if t in _DOMAIN_NOUNS), max(tks, key=len))
+        mods = [t for t in tks if t != main]
+        if mods:
+            mods_expr = " + ".join(f"'{m}'" for m in mods)
+            expr = f"SU='{main}' * ({mods_expr})"
+        else:
+            expr = f"SU='{main}' or TKA='{main}'"
+
     if journal:
         expr += f" and LY='{journal}'"
     return expr
