@@ -32,6 +32,14 @@ _EXCLUDE_KEYWORDS = (
 )
 
 
+def detect_lang(text: str) -> str:
+    """粗判文本语种：中文返回 zh，其余返回 en。用于中英文文献分别统计。"""
+    if not text:
+        return "?"
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return "zh" if cjk >= 3 else "en"
+
+
 def search_crossref(query: str, limit: int = 15) -> str:
     """在 Crossref 中检索真实存在的学术文献，返回可溯源记录。
 
@@ -73,8 +81,9 @@ def search_crossref(query: str, limit: int = 15) -> str:
         )
         doi = it.get("DOI", "N/A")
         cited = it.get("is-referenced-by-count", "?")
+        lang = detect_lang(title)
         lines.append(
-            f"- {title} ({year}) | {authors} | {venue} | DOI:{doi} | 被引:{cited}"
+            f"- {title} ({year}) | {authors} | {venue} | DOI:{doi} | 被引:{cited} | 语言:{lang}"
         )
         if len(lines) >= limit:
             break
