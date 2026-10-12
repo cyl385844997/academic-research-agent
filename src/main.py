@@ -411,7 +411,7 @@ def _resolve_topic(topic: str) -> dict:
     return {
         "zh_query": zh,
         "cnki_query": cnki_query,
-        "english_queries": en_queries[:2],
+        "english_queries": en_queries[:4],
         "source": source,
         "explanation": explanation,
         "concept": concept,

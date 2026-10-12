@@ -97,37 +97,57 @@ def analyze_with_lexicon(topic: str):
     }
 
 
-def _build_english_by_role(obj_cn, cond_cn, task_cn, max_queries: int = 2) -> list:
-    """按语义角色分配英文检索词，而非单纯按词长。
+def _build_english_by_role(obj_cn, cond_cn, task_cn, max_queries: int = 4) -> list:
+    """按语义角色构建英文检索式：**对象与条件组合（AND），不分开单独检索**。
 
-    关键：中文主题里**条件词的英文等价往往比对象词更关键**——
-    「高水位排水管网诊断」的对象是排水管网（英文 sewer network，检索泛），
-    但条件"高水位"对应 infiltration/inflow，才是拉开文献差异的关键。
-    故：条件词与对象词的英文各取一条，任务词并入。
+    历史教训（2026-10-12 实弹试射「排水管网高水位状态下的检测与诊断」）：
+    旧实现「条件词与对象词的英文各取一条、分别检索」，两个缺陷叠加导致精度崩坏——
+    1. 每个角色只取 en[0]，而词典条目顺序不可靠：「高水位」的 en[0] 恰好是
+       字面直译 "high water level"（潮位/沼泽/地衣全文都是），真正有区分度的
+       "full pipe flow"/"surcharge" 被丢弃；
+    2. 条件与对象分开检索、从未 AND："high water level" 单独检索必然召回
+       海洋/沼泽/词典条目，"sewer network" 单独检索只得泛泛的管网文献。
+
+    新设计：
+    - 对象角色取前 2 个等价词（近义互换，负责广召回）；
+    - 条件角色取**全部**等价词（区分度所在，缺一个就漏一类文献）；
+    - 组合 = 对象[0] 与每个条件等价词各成一条（词间空格隐含 AND），
+      再加一条对象单独检索兜底；
+    - 上限 4 条：3 源 × 4 条 = 12 次请求，下游按 DOI/标题去重，
+      查询重叠不会产生重复文献。
     """
-    def first_en(cn_list):
+    def en_all(cn_list, cap=None):
+        out = []
         for cn in cn_list:
-            terms = LEXICON.get(cn, {}).get("en", [])
-            if terms:
-                return terms[0]
-        return None
+            for t in LEXICON.get(cn, {}).get("en", []):
+                if t not in out:
+                    out.append(t)
+        return out[:cap] if cap else out
+
+    obj_terms = en_all(obj_cn[:2], cap=3)
+    cond_terms = en_all(cond_cn[:2], cap=3)
+    task_terms = en_all(task_cn[:1], cap=1)
 
     queries = []
-    # 1) 条件的英文等价（若条件词在词典中有等价概念，优先取）
-    for cn in cond_cn[:2]:
-        t = first_en([cn])
-        if t:
-            queries.append(t)
-            break
-    # 2) 对象的英文等价
-    t = first_en(obj_cn[:2])
-    if t:
-        queries.append(t)
-    # 3) 任务的英文等价（补足）
+    if obj_terms and cond_terms:
+        base = obj_terms[0]
+        for ct in cond_terms:
+            queries.append(f"{base} {ct}")
+        queries.append(base)  # 对象单独检索兜底
+    elif cond_terms:
+        queries.extend(cond_terms)
+    elif obj_terms:
+        # 对象型主题无精度锚点，广召回优先：等价词全出（含常用缩写，
+        # 如「侧流生物除磷」的 sidestream EBPR / S2EBPR——旧实现只取
+        # en[0] 的形式全称，漏掉文献里大量使用缩写的论文）
+        queries.extend(obj_terms)
+
+    # 任务词补足（空间富余时才加，与对象组合）
     if len(queries) < max_queries:
-        t = first_en(task_cn[:1])
-        if t and t not in queries:
-            queries.append(t)
+        for tt in task_terms:
+            if tt not in queries:
+                queries.append(f"{obj_terms[0]} {tt}" if obj_terms else tt)
+                break
 
     # 去重保序
     seen, out = set(), []
