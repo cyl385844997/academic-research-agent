@@ -70,6 +70,10 @@ def build_literature_crew(topic: str, llm, tools, search_results: str = "",
         expected_output="一份带真实 DOI 的文献清单。",
         agent=researcher,
     )
+    analyze_kwargs = {}
+    if not search_results:
+        analyze_kwargs["context"] = [search_task]
+
     analyze_task = Task(
         description=(
             f"基于检索结果，分析「{topic}」的研究现状、主流技术路线、主要争议与未解决空白，"
@@ -78,7 +82,7 @@ def build_literature_crew(topic: str, llm, tools, search_results: str = "",
         ),
         expected_output="研究现状综述（含中英文对比）+ 研究空白清单 + 立项价值判断。",
         agent=analyst,
-        context=[search_task],
+        **analyze_kwargs,
     )
     write_task = Task(
         description=(
@@ -93,6 +97,18 @@ def build_literature_crew(topic: str, llm, tools, search_results: str = "",
         context=[analyze_task],
         output_file="reports/literature_report.md",
     )
+
+    if search_results:
+        # 检索已由代码完成（fetch_literature_grounded），**不设「文献检索员」角色**。
+        # 实测（2026-10-12）：tools=[] 时该角色会凭参数记忆编一份文献清单，
+        # 经 context 传给分析员/撰稿员，是正文假引用的源头之一；且其产出无法对账。
+        # 资料员/研究员分工铁律：检索由代码持有，LLM 只分析已保存的数据。
+        return Crew(
+            agents=[analyst, writer],
+            tasks=[analyze_task, write_task],
+            process=Process.sequential,
+            verbose=True,
+        )
 
     return Crew(
         agents=[researcher, analyst, writer],

@@ -364,6 +364,61 @@ def sanitize_report_urls(report_path: str, allowed_urls):
         print(f"  ⚠️ URL 护栏：已剥离 {removed} 处非真实来源的链接（标记为「来源待核实」）")
 
 
+# DOI 抽取：先粗取 \S+，再按中文标点/空白截断。注意不能按 ASCII 括号截断——
+# ASCE 类真实 DOI 含括号（如 10.1061/(asce)0733-9429(2003)129:7(504)）。
+_DOI_RE = re.compile(r"10\.\d{4,9}/\S{3,}")
+
+
+def _clean_doi(s: str) -> str:
+    """规整 DOI 用于比对：小写、去尾部标点、剔除不成对的右括号。"""
+    t = re.split(r"[\s，。；、：,;）]", str(s or "").strip())[0]
+    t = t.rstrip(".,;")
+    while t.endswith(")") and t.count(")") > t.count("("):
+        t = t[:-1]
+    return t.lower()
+
+
+def sanitize_report_citations(report_path: str, allowed_dois):
+    """可溯源硬性护栏（引用级）：剔除报告中不在真实检索结果内的 DOI。
+
+    背景（实测 2026-10-12）：学术线撰稿员在 tools=[]（无联网）时，不仅会编 URL，
+    **更会编 DOI**——旧版 literature_report.md 引用 51 个 DOI，只有 1 个能在
+    真实检索清单（literature_references.tsv）里找到，其余 50 个系凭参数记忆生成
+    （如 10.1016/j.envres.2021.111609）。Crew 提示词里已写「逐字照抄、严禁编造」，
+    但实测无效，故必须像 URL 一样做代码级兜底：凡 DOI 不在 allowed_dois 内，
+    一律替换为「〔DOI 不可溯源，已剔除〕」并计数告警。
+
+    Args:
+        report_path: 报告文件路径
+        allowed_dois: 真实检索结果的 DOI 集合（list/set of str，无 DOI 的记录传空串）
+    Returns:
+        被剔除的 DOI 清单（去重、保持出现顺序）
+    """
+    allowed = {_clean_doi(d) for d in (allowed_dois or []) if d}
+    if not os.path.exists(report_path) or not allowed:
+        return []
+    with open(report_path, encoding="utf-8") as f:
+        text = f.read()
+
+    dropped = []
+
+    def _sub(m):
+        doi = _clean_doi(m.group(0))
+        if doi in allowed:
+            return m.group(0)
+        if doi and doi not in dropped:
+            dropped.append(doi)
+        return "〔DOI 不可溯源，已剔除〕"
+
+    text = _DOI_RE.sub(_sub, text)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    if dropped:
+        print(f"  🚨 DOI 护栏：已剔除 {len(dropped)} 个不在检索结果中的编造引用")
+        print(f"     例：{dropped[0]} / {dropped[1] if len(dropped) > 1 else ''}")
+    return dropped
+
+
 def _chinese_portion(topic: str) -> str:
     """从混合检索词中提取中文部分（知网只对中文查询有意义）。
 
@@ -857,6 +912,11 @@ def main():
         # 3) 后处理：剥离可能伪造的 TSV，追加真实 TSV
         print("[3/3] 正在生成报告...")
         report_path = os.path.join("reports", "literature_report.md")
+        # 可溯源护栏（引用级）：剔除撰稿员凭参数记忆编造的 DOI。
+        # 实测旧报告 51 个引用里 50 个不在检索结果中，故 prompt 约束不够，必须代码兜底。
+        sanitize_report_citations(
+            report_path, allowed_dois=[p["doi"] for p in papers if p.get("doi")]
+        )
         from src.main import _LAST_TRACE
         trace_md = "\n".join(_LAST_TRACE) if _LAST_TRACE else "（无溯源记录）"
         tsv_block = (
