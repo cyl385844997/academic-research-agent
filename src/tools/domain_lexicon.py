@@ -99,18 +99,39 @@ WET_WEATHER = {
         "note": "字面 rain-sewage mixing 在英文库几乎搜不到",
     },
     "入流入渗": {
-        "cnki": ["入流入渗", "地下水入渗", "外水入渗"],
-        "en": ["infiltration and inflow", "I/I", "inflow", "groundwater infiltration"],
-    },
-    "高水位": {
-        "cnki": ["高水位", "水位升高", "满管"],
+        "cnki": ["入流入渗", "地下水入渗", "外水入渗", "入渗评估"],
         "en": [
             "infiltration and inflow",
-            "high water level",
-            "high groundwater level",
-            "full pipe flow",
+            "I/I",
+            "infiltration and inflow assessment",
+            "I/I assessment",
+            "inflow",
+            "groundwater infiltration",
         ],
-        "note": "中文「管网高水位」多指地下水/河水入渗，英文对应 I/I 概念",
+        "note": "外水问题需配套流量监测/地下水水位监测/降雨监测；独立于常规管道状况评估",
+    },
+    # 【用户纠正】"高水位"有两种语义，原先混在一条里是错的：
+    #   (a) 管网运行水位偏高（满管流/溢流风险）—— 水力运行状态问题
+    #   (b) 地下水/河水入渗导致的水位升高 —— 外水问题（见「入流入渗」/「外水」）
+    # 二者技术路线完全不同，故拆为独立概念。
+    "高水位": {
+        "cnki": ["高水位", "水位升高", "满管", "满管流"],
+        "en": [
+            "high water level",
+            "full pipe flow",
+            "surcharge",
+        ],
+        "note": "指管网运行水位偏高（满管流/溢流风险）；若指地下水入渗请用「入流入渗」或「外水」",
+    },
+    "满管度": {
+        "cnki": ["满管度", "满管流", "充满度"],
+        "en": [
+            "pipe fullness",
+            "h/D ratio",
+            "relative depth",
+            "filling ratio",
+        ],
+        "note": "英文文献描述管网运行状态的标准指标，常与高水位/溢流风险同时出现",
     },
     "冲击负荷": {
         "cnki": ["冲击负荷", "负荷冲击", "瞬时负荷"],
@@ -119,6 +140,29 @@ WET_WEATHER = {
     "短程脱氮": {
         "cnki": ["短程脱氮", "短程硝化反硝化", "部分硝化"],
         "en": ["shortcut nitrogen removal", "partial nitritation", "A-B stage"],
+    },
+    "同步硝化反硝化": {
+        "cnki": ["同步硝化反硝化", "SND", "同步反硝化"],
+        "en": [
+            "simultaneous nitrification and denitrification",
+            "SND",
+            "simultaneous nitrification denitrification",
+        ],
+        "note": "节能降碳背景下的高频概念，与短程脱氮(SBR/PN)是不同技术路线",
+    },
+    "厌氧氨氧化": {
+        "cnki": ["厌氧氨氧化", "Anammox", "厌氧氨氧化工艺"],
+        "en": [
+            "anammox",
+            "anaerobic ammonium oxidation",
+            "partial nitritation anammox",
+            "PN/A",
+        ],
+        "note": "低碳氮比/能源自给方向的必备术语，常与部分硝化组成 PN/A",
+    },
+    "部分硝化": {
+        "cnki": ["部分硝化", "PN", "亚硝化"],
+        "en": ["partial nitritation", "partial nitrification", "PN"],
     },
 }
 
@@ -205,8 +249,15 @@ ENERGY = {
         "en": ["pumping system", "pump system"],
     },
     "管网水力": {
-        "cnki": ["管网水力", "水力特性", "水头损失"],
-        "en": ["pipe hydraulics", "hydraulic characteristics", "head loss"],
+        "cnki": ["管网水力", "水力特性", "水头损失", "SWMM", "水力模型"],
+        "en": [
+            "pipe hydraulics",
+            "SWMM",
+            "hydraulic modeling",
+            "sewer hydraulic model",
+        ],
+        "note": "英文溢流分析/管网诊断文献实际检索词常用 SWMM 或 hydraulic modeling，"
+        "而非仅 pipe hydraulics",
     },
 }
 
@@ -221,13 +272,18 @@ SEWER = {
         "en": ["sewer pipe", "pipeline", "conduit"],
     },
     "管网诊断": {
-        "cnki": ["管网诊断", "诊断", "状况评估"],
+        "cnki": ["管网诊断", "诊断", "状况评估", "入渗评估"],
         "en": [
             "sewer condition assessment",
             "sewer diagnosis",
             "pipeline condition assessment",
             "sewer inspection",
+            # I/I 评估是独立技术方向（流量/地下水水位/降雨监测系统方法），
+            # 用户建议补入，与常规管道状况评估并列
+            "infiltration and inflow assessment",
+            "I/I assessment",
         ],
+        "note": "常规状况评估（CCTV/缺陷检测）与 I/I 评估是两条独立技术路线，可并列检索",
     },
     "非开挖检测": {
         "cnki": ["非开挖检测", " CCTV检测", "管道检测"],
@@ -259,8 +315,17 @@ SEWER = {
         "en": ["district metered area", "DMA", "district metering"],
     },
     "外水": {
-        "cnki": ["外水", "地下水入渗", "外水入渗"],
-        "en": ["inflow", "groundwater infiltration", "I/I", "extraneous water"],
+        "cnki": ["外水", "地下水入渗", "外水入渗", "入渗评估"],
+        "en": [
+            "infiltration and inflow",
+            "I/I",
+            "infiltration and inflow assessment",
+            "I/I assessment",
+            "inflow",
+            "groundwater infiltration",
+            "extraneous water",
+        ],
+        "note": "「高水位」若指地下水入渗导致，应使用本条目而非「高水位」条目",
     },
     "同位素": {
         "cnki": ["同位素", "氢氧稳定同位素", "稳定同位素"],
@@ -370,18 +435,42 @@ def lookup(text: str):
 
     采用**最长优先**匹配，避免「侧流」先于「侧流生物除磷」命中而丢掉更具体的概念。
 
+    支持两类输入：
+      - 中文概念名（如「高水位」「同步硝化反硝化」）
+      - 英文术语（如「SWMM」「anammox」「EBPR」）——按词典的 en 字段反查
+
     Args:
-        text: 待匹配文本，如「高水位排水管网诊断」
+        text: 待匹配文本，如「高水位排水管网诊断」或「SWMM 溢流分析」
 
     Returns:
         命中的概念列表（长概念在前），未命中返回 []
     """
     hits = []
+    raw = text or ""
+    low = raw.lower()
+
     for cn in LEXICON:
-        if cn in text:
+        if cn in raw:
             hits.append(cn)
-    # 按长度降序（更具体的概念优先）
-    return sorted(hits, key=len, reverse=True)
+            continue
+        # 英文反查：概念名本身是英文缩写，或其 en 术语出现在文本中
+        entry = LEXICON.get(cn, {})
+        if cn.isascii() and len(cn) >= 2 and cn.lower() in low:
+            hits.append(cn)
+            continue
+        for en in entry.get("en", []):
+            # 只用较长的英文术语反查，避免 short词误命中（如 "I/I"、"CN"）
+            if len(en) >= 4 and en.lower() in low:
+                hits.append(cn)
+                break
+
+    # 去重并按长度降序（更具体的概念优先）
+    seen, ordered = set(), []
+    for c in sorted(hits, key=len, reverse=True):
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
 
 
 def covered_ratio(text: str, english_words) -> float:
