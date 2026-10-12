@@ -225,6 +225,12 @@ def main():
     crew = build_market_crew(TOPIC, llm, tools=[], search_results=market_ctx)
     crew.kickoff()
 
+    # 可溯源护栏：剥离撰稿员凭记忆编造的链接（不在真实检索结果内）
+    main_mod.sanitize_report_urls(
+        os.path.join(ROOT, "reports", "market_report.md"),
+        allowed_urls=[r["url"] for r in records],
+    )
+
     report_path = os.path.join(ROOT, "reports", "market_report.md")
     trace_md = "\n".join(trace)
     tsv_block = ("## 检索过程溯源\n\n" + trace_md + "\n\n"

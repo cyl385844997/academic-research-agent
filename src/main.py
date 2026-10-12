@@ -294,6 +294,66 @@ def append_grounded_refs(report_path: str, block: str):
         f.write(content)
 
 
+def _norm_url(u: str) -> str:
+    """规范化 URL 用于比对（去尾斜杠、小写 scheme+netloc+path）。"""
+    u = (u or "").strip().rstrip("/")
+    try:
+        p = urlparse(u)
+        return (p.scheme + "://" + p.netloc + p.path).lower().rstrip("/")
+    except Exception:  # noqa: BLE001
+        return u.lower().rstrip("/")
+
+
+def sanitize_report_urls(report_path: str, allowed_urls):
+    """可溯源硬性护栏：删除报告中任何不在「真实检索结果」集合内的 URL。
+
+    原因：实测 CrewAI 撰稿员在 tools=[]（无联网）时，会凭自身记忆「补」出
+    看似合理但并未检索到的链接（linkedin/researchgate/qq.com 等变体），
+    即使 prompt 已要求「逐字照抄」。仅靠 prompt 不可靠，故做代码级兜底：
+    凡是报告里出现、但不在 allowed_urls 中的链接，一律剥离（保留文字、标注待核实）。
+    允许的 URL 集合来自真实检索记录；本函数运行在 Crew 写稿之后、对比表追加之前，
+    而对比表本身含真实 URL，故不会被误伤。
+
+    Args:
+        report_path: 报告文件路径
+        allowed_urls: 真实检索结果 URL 集合（list/set of str）
+    """
+    allowed = {_norm_url(u) for u in (allowed_urls or [])}
+    if not os.path.exists(report_path) or not allowed:
+        return
+    with open(report_path, encoding="utf-8") as f:
+        text = f.read()
+
+    removed = 0
+
+    # 1) markdown 链接 [文字](url)
+    def _md(m):
+        nonlocal removed
+        label, url = m.group(1), m.group(2).strip()
+        if _norm_url(url) in allowed:
+            return m.group(0)
+        removed += 1
+        return f"{label}（来源待核实）"
+
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", _md, text)
+
+    # 2) 裸 URL（排除刚处理过的 markdown 链接内 URL；上一轮已替换为文字，故此处基本只剩裸链）
+    def _bare(m):
+        nonlocal removed
+        url = m.group(0).strip()
+        if _norm_url(url) in allowed:
+            return url
+        removed += 1
+        return "（来源待核实）"
+
+    text = re.sub(r"(?<!\()(?<!\])(?<!\[)(https?://[^\s)\]<>]+)", _bare, text)
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    if removed:
+        print(f"  ⚠️ URL 护栏：已剥离 {removed} 处非真实来源的链接（标记为「来源待核实」）")
+
+
 def _chinese_portion(topic: str) -> str:
     """从混合检索词中提取中文部分（知网只对中文查询有意义）。
 
@@ -671,6 +731,12 @@ def main():
         print("[3/3] 正在运行 CrewAI 三角色分析...")
         crew = build_market_crew(args.topic, llm, tools, search_results=market_ctx)
         crew.kickoff()
+
+        # 可溯源护栏：剥离撰稿员可能凭记忆编造的链接（不在真实检索结果内）
+        sanitize_report_urls(
+            os.path.join("reports", "market_report.md"),
+            allowed_urls=[r["url"] for r in records],
+        )
 
         report_path = os.path.join("reports", "market_report.md")
         trace_md = "\n".join(trace)
