@@ -15,5 +15,10 @@ memory/*
 # 历史判断，属商业敏感信息。仅模板 example 入库，真实文件绝不可公开。
 knowledge/company_profile.yaml
 knowledge/company_profile.yml
+# L3 敏感代号映射：与 profile 分目录存放，整目录单独盯（D-1 约束 1）。
+# 三约束与退回条款见 docs/company_profile-schema-v1.md 第 5 节。
+knowledge/private/*
+!knowledge/private/.gitkeep
+!knowledge/private/mappings.example.yaml
 *.log
 .DS_Store
