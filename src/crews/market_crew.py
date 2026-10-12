@@ -12,7 +12,8 @@
 from crewai import Agent, Task, Crew, Process
 
 
-def build_market_crew(topic: str, llm, tools, search_results: str = ""):
+def build_market_crew(topic: str, llm, tools, search_results: str = "",
+                      memory: str = ""):
     context_block = (
         f"## 真实检索结果（含可信度分级，严禁编造产品名/链接/功能）\n"
         f"{search_results}\n"
@@ -22,6 +23,9 @@ def build_market_crew(topic: str, llm, tools, search_results: str = ""):
         "（未预置检索结果，请使用 Web 检索工具获取真实来源；"
         "所有 URL 必须来自工具返回，产品名不得凭印象编造）"
     )
+    # 长期记忆：操作者偏好与领域约定（block 自带标题，此处只拼接）
+    if memory:
+        context_block += f"\n\n{memory}"
 
     scout = Agent(
         role="市场情报侦察员",

@@ -6,5 +6,10 @@ venv/
 .pytest_cache/
 # 生成的报告产物不入库（含 .md 报告与 .tsv 文献表）
 reports/*
+# 记忆库不入库：含操作者个人偏好、在办课题等私密上下文。
+# 本仓库为 public，记忆内容不应公开。仅保留目录占位与说明。
+memory/*
+!memory/.gitkeep
+!memory/README.md
 *.log
 .DS_Store

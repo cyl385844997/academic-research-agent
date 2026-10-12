@@ -154,12 +154,48 @@ python src/main.py --mode literature --topic "side-stream EBPR wet weather overf
 
 # 市场 / 竞品调研
 python src/main.py --mode market --topic "AI 基金申请书 产品 2026"
+
+# 记忆库
+python src/main.py --mode memory --topic "高水位"      # 查相关记忆
+python src/main.py --mode memory --topic "refresh"     # 从会话日志自动提炼（演练）
 ```
 
 执行完成后，报告生成在 `reports/` 目录：
 
 - `literature_report.md` / `market_report.md` —— 分析报告
 - `literature_references.tsv` / `market_references.tsv` —— 真实文献表（**可直接粘贴进 Excel**）
+
+## 记忆库：让 Agent 记住你的偏好
+
+跑过几次之后你会发现，同一条纠正不该反复说第二遍。记忆库就是为此存在的。
+
+```bash
+# 记一条本次会话要点（日后自动从中提炼长期记忆）
+python src/main.py --mode memory --topic "log 用户要求：报告里的实测值要脱敏"
+
+# 自动提炼「值得长期记住」的信息——默认只演练，加 --confirm 才真正落库
+python src/main.py --mode memory --topic "refresh"
+python src/main.py --mode memory --topic "refresh" --confirm
+
+# 手动加一条偏好，或直接用记事本改 memory/entries/*.md
+python src/main.py --mode memory --topic "add 以后给我 TSV 表格，不要 xlsx"
+python src/main.py --mode memory --topic "list"      # 看全部
+python src/main.py --mode memory --topic "stats"     # 统计
+python src/main.py --mode memory --topic "pending"   # 看待裁决的提案
+```
+
+运行 `literature` / `market` 时，程序会按主题自动召回相关记忆，
+以「优先于你的通用写作习惯」的措辞注入分析过程。
+
+**三条设计取向**（细节见 `memory/README.md`）：
+
+1. **你可以随时直接编辑记忆**——一条记忆就是一个 Markdown 文件，记事本就能改，
+   改完立即生效。不用学任何命令。
+2. **LLM 只提议、不直接落库**。自动提炼出来的东西分两类：
+   确实全新的、以及需要人工裁决的（与既有记忆重复、或口径矛盾）。
+   后者进 `pending.md` 等你裁定——因为错记忆一旦自动生效，会持续污染后续所有输出。
+3. **记忆库不入库**。本仓库是 public，而记忆含你的个人偏好与在办课题，
+   已由 `.gitignore` 排除，仅目录说明随仓库保留。
 
 ## 目录结构
 

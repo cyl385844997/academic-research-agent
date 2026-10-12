@@ -10,7 +10,8 @@ from src.tools.literature_tool import literature_search
 from src.tools.web_tool import web_search
 
 
-def build_literature_crew(topic: str, llm, tools, search_results: str = ""):
+def build_literature_crew(topic: str, llm, tools, search_results: str = "",
+                          memory: str = ""):
     # 把真实检索结果作为硬上下文注入分析与撰写环节
     context_block = (
         f"## 真实检索结果（来自真实学术数据库，含真实 DOI，严禁编造、严禁替换）\n"
@@ -21,6 +22,9 @@ def build_literature_crew(topic: str, llm, tools, search_results: str = ""):
         if search_results else
         "（未预置检索结果，请使用文献检索工具获取真实文献，且所有 DOI 必须来自工具返回）"
     )
+    # 长期记忆：操作者偏好与领域约定（block 自带标题，此处只拼接）
+    if memory:
+        context_block += f"\n\n{memory}"
 
     researcher = Agent(
         role="文献检索员",
