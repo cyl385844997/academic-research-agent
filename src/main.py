@@ -614,7 +614,7 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
 
 
 def _cmd_memory(topic: str, confirm: bool = False) -> int:
-    """记忆库 CLI：list / stats / recall / refresh / add / pending。"""
+    """记忆库 CLI：list / stats / recall / refresh / add / pending / stale / confirm / drop。"""
     from src.tools import memory_store as _ms
 
     op = (topic or "").strip()
@@ -626,9 +626,13 @@ def _cmd_memory(topic: str, confirm: bool = False) -> int:
             print("记忆库为空。可用 `--mode memory --topic \"refresh\"` 从会话日志自动提炼。")
             return 0
         for e in items:
+            st = _ms.staleness(e)
             flag = {"active": "生效", "superseded": "已取代",
                     "rejected": "已否决", "draft": "草稿"}[e.status]
-            print(f"[{e.id}|{e.kind}|{flag}] {e.title}")
+            mark = ""
+            if st["stale"] and st["age"] is not None:
+                mark = f"  ⚠️ 久未确认 {st['age']} 天（TTL {st['ttl']} 天）"
+            print(f"[{e.id}|{e.kind}|{flag}] {e.title}{mark}")
         print(f"\n共 {len(items)} 条。编辑文件：{_ms.ENTRIES_DIR}")
         return 0
 
@@ -640,8 +644,58 @@ def _cmd_memory(topic: str, confirm: bool = False) -> int:
         print(f"  生效 {s['active']}｜已取代 {s['superseded']}"
               f"｜已否决 {s['rejected']}｜草稿 {s['draft']}")
         print(f"  会话日志 {s['daily_files']} 篇｜待审提案：{'有' if s['pending'] else '无'}")
+        print(f"  久未确认 {s['stale']} 条"
+              f"（已降权但仍生效，复审见 `--mode memory stale`）")
         print(f"  目录：{_ms.MEM_DIR}")
         return 0
+
+    if low in ("stale", "review"):
+        items = _ms.build_review_queue()
+        if not items:
+            print("没有久未确认的记忆。TTL："
+                  f"user {_ms.TTL_DAYS['user']} 天 / "
+                  f"project {_ms.TTL_DAYS['project']} 天 / "
+                  f"domain {_ms.TTL_DAYS['domain']} 天")
+            return 0
+        print(f"久未确认的记忆（{len(items)} 条）。已降权 "
+              f"×{_ms.STALE_FACTOR}，仍生效但可能不适用：\n")
+        for st, e in items:
+            last = (e.confirmed or e.updated or e.created or "未知")[:10]
+            badge = {"user": "偏好", "project": "在办", "domain": "领域"}.get(e.kind, e.kind)
+            over = st["age"] / max(1, st["ttl"])
+            print(f"[{e.id}|{badge}] {e.title}")
+            print(f"    上次确认 {last}｜已有 {st['age']} 天｜TTL {st['ttl']} 天"
+                  f"｜超期 {over:.1f}×")
+            print(f"    仍然成立 → --mode memory --topic \"confirm {e.id}\"")
+            print(f"    已被取代 → --mode memory --topic \"drop {e.id}\"（转归档）")
+            print()
+        p = _ms.write_review_file()
+        if p:
+            print(f"复审清单已写入：{p}")
+        return 0
+
+    if low.startswith("confirm "):
+        eid = op[8:].strip()
+        e = _ms.confirm_entry(eid)
+        if not e:
+            print(f"未找到记忆 {eid}")
+            return 1
+        print(f"已确认 {e.id}：{e.title}")
+        # 注意读 confirmed 而非 updated——touch() 不改 updated（内容没变），
+        # 用 updated 会显示旧日期，看起来像确认没生效。
+        print(f"下次复审：{(e.confirmed or '')[:10]} 起算 {e.kind} 的 TTL "
+              f"（{_ms.ttl_days(e)} 天）")
+        return 0
+
+    if low.startswith("drop "):
+        eid = op[5:].strip()
+        e = _ms.get_entry(eid)
+        if not e:
+            print(f"未找到记忆 {eid}")
+            return 1
+        ok = _ms.delete_entry(eid)   # 默认转归档，可回溯
+        print(f"{'已转归档' if ok else '处理失败'}：{eid} {e.title}")
+        return 0 if ok else 1
 
     if low == "refresh":
         content = "\n".join(mx.refresh_from_daily(days=3))
@@ -671,6 +725,10 @@ def _cmd_memory(topic: str, confirm: bool = False) -> int:
         else:
             print("\n以上仅为演练。确认要采纳请加 --confirm 重新运行，"
                   "或手动编辑 memory/pending.md。")
+        n_stale = len(_ms.build_review_queue())
+        if n_stale:
+            print(f"\n另有 {n_stale} 条已生效的记忆久未确认（已降权但仍生效），"
+                  f"见 `--mode memory stale`")
         return 0
 
     if low.startswith("add "):
@@ -722,10 +780,15 @@ def _cmd_memory(topic: str, confirm: bool = False) -> int:
     print(f"与「{op}」相关的记忆（{len(items)} 条）：\n")
     for e in items:
         badge = {"user": "偏好", "project": "在办", "domain": "领域"}.get(e.kind, e.kind)
-        print(f"[{e.id}|{badge}] {e.title}")
+        st = _ms.staleness(e)
+        mark = ""
+        if st["stale"] and st["age"] is not None:
+            mark = f"  ⚠️ 久未确认 {st['age']} 天（TTL {st['ttl']} 天）"
+        print(f"[{e.id}|{badge}] {e.title}{mark}")
         for ln in e.body.strip().splitlines():
-            if ln.strip():
-                print(f"    {ln.strip()}")
+            ln = _ms._strip_marker(ln)
+            if ln:
+                print(f"    {ln}")
         print()
     return 0
 
@@ -740,7 +803,9 @@ def main():
         help="literature=论文检索综述；market=市场/竞品调研；memory=记忆库管理",
     )
     parser.add_argument("--topic", required=True,
-                        help="研究主题 / 检索词；memory 模式下支持 list|stats|refresh|add <内容>|pending")
+                        help="研究主题 / 检索词；memory 模式下支持 "
+                             "list|stats|stale|recall|refresh|add <内容>|pending|"
+                             "confirm <ID>|drop <ID>|pending-clear")
     parser.add_argument("--confirm", action="store_true",
                         help="memory refresh 时真正写入记忆库（默认仅演练预览）")
     args = parser.parse_args()
