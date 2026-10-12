@@ -28,9 +28,13 @@
 | `src/tools/web_tool.py` | Web 检索（Tavily / DuckDuckGo） |
 | `src/crews/literature_crew.py` | 论文检索三角色：检索员→分析员→撰稿员 |
 | `src/crews/market_crew.py` | 市场调研三角色 |
-| `src/main.py` | CLI 入口：`--mode literature|market --topic "..."`；含三级文献源容错 |
+| `src/main.py` | CLI 入口：`--mode literature|market|memory --topic "..."`；含三级文献源容错 |
+| `src/tools/memory_store.py` | 记忆库存储层：分文件读写、召回打分、去重、冲突检测、归档 |
+| `src/tools/memory_extract.py` | 记忆自动整理：LLM 提炼候选 + 语义裁决（矛盾 vs 改述） |
+| `src/tools/memory_tool.py` | 记忆的 CrewAI 工具包装（Agent 运行时可检索/记待审） |
 | `knowledge/` | 领域知识沉淀（v0.2 起），当前为空 |
 | `reports/` | 生成报告，默认不入库 |
+| `memory/` | 长期记忆库（操作者偏好与领域约定），**默认不入库** |
 
 ## 多源容错（文献检索）
 `fetch_literature_grounded()` 依次尝试 **Semantic Scholar → OpenAlex → Crossref**，
@@ -61,6 +65,55 @@
   不闷头输出低质文献。
 - 修改期刊名单时注意：白名单用于保护中文核心/权威刊，黑名单用于剔除灌水刊，
   两者都会随期刊生态变化而需定期更新。
+
+## 记忆库（memory/）
+
+让 Agent 记住操作者的偏好与领域约定，避免每次都重复纠正。
+
+### 目录结构
+```
+memory/
+  entries/     一条记忆一个文件（YAML frontmatter + 正文），可直接用编辑器改
+  daily/       每日会话日志（append-only），refresh 的提炼素材
+  archive/     被覆盖/删除的历史版本（可回溯）
+  pending.md   待人工裁决的记忆提案
+```
+
+### 核心设计原则（改代码前必读）
+1. **LLM 只提议，不直接落库**。`memory_extract.extract_candidates()` 产出候选，
+   经语义裁决后分流：`new`/`supplement` 才可能入库；`same`（与既有重复）、
+   `conflict`（口径相悖）、`unknown`（判不准）一律写入 `pending.md` 等人工裁决。
+   理由与「可溯源铁律」同源：模型误判的记忆一旦自动落库，会持续污染后续所有输出。
+2. **`refresh` 默认是演练**，须显式 `--confirm` 才真正写库。
+3. **冲突熔断**：同一议题（topic_key 匹配）出现相悖口径时，程序不自动择一，
+   标记 conflict 交人工裁决。
+4. **词面相似度不能判断语义**（实测：`高水位=满管流` vs `高水位=地下水入渗`
+   得分 0.48，**高于**真正的重复对 0.41）。故相似度只用于缩小范围，
+   矛盾/重复判定必须由 LLM 完成（`adjudicate()`）。
+5. **`always` 由 LLM 判断**（「换个主题还成立吗」），不按 kind 一刀切——
+   否则主题性事实会污染每次输出。
+6. **凭证不入库**：`_has_secret()` 拦截 `ghp_`/`sk-`/AKIA/password/token 等特征，
+   命中即丢弃。
+7. **不静默覆盖**：更新/删除都先转 `archive/`，可回溯。
+8. **local-first**：全部落本地，`.gitignore` 排除，不上传任何服务。
+
+### 常用命令
+```bash
+python src/main.py --mode memory --topic "高水位"        # 按主题召回
+python src/main.py --mode memory --topic "list"          # 列出全部
+python src/main.py --mode memory --topic "stats"         # 统计
+python src/main.py --mode memory --topic "log <要点>"    # 记一条会话日志
+python src/main.py --mode memory --topic "refresh"       # 自动提炼（演练）
+python src/main.py --mode memory --topic "refresh" --confirm   # 真正落库
+python src/main.py --mode memory --topic "add <正文>"    # 手动加一条偏好
+python src/main.py --mode memory --topic "pending"       # 查看待审提案
+python src/main.py scripts/selftest_memory.py            # 自测（22 项）
+```
+
+### 如何影响输出
+`main.py` 在 literature / market 模式下用 `build_memory_block(topic)` 按主题召回，
+把结果作为 `memory=` 参数注入 Crew 的 context，措辞为
+「必须遵守，优先于你的通用写作习惯」。召回为空时返回空串，不影响主流程。
 
 ## 硬性约束：不得让 LLM 生成文献表
 任何改动都不得让 LLM 负责「列出参考文献/来源链接」。文献表一律由

@@ -3,6 +3,13 @@
 用法：
   python src/main.py --mode literature --topic "side-stream EBPR wet weather overflow"
   python src/main.py --mode market    --topic "AI 基金申请书 产品 2026"
+  python src/main.py --mode memory    --topic "高水位"        # 查看与该主题相关的记忆
+  python src/main.py --mode memory    --topic "list"         # 列出全部记忆
+  python src/main.py --mode memory    --topic "stats"        # 记忆库统计
+  python src/main.py --mode memory    --topic "refresh"      # 从最近会话日志自动提炼
+
+记忆库（`memory/`）：长期积累的操作者偏好与领域约定，会注入 Crew 影响输出。
+LLM 只提议、不直接落库；`memory/pending.md` 里的提案需人工确认。
 
 依赖（在项目根目录执行）：
   pip install -r requirements.txt
@@ -36,6 +43,9 @@ from src.tools.cnki_tool import cnki_search, search_cnki, build_advanced_query
 from src.tools.query_translator import understand_topic, translate_to_english_queries
 from src.tools.core_journals import CORE_JOURNALS, CORE_JOURNAL_GROUPS
 from src.tools.market_query import DIMENSIONS, build_market_queries
+from src.tools import memory_store as ms
+from src.tools.memory_store import build_memory_block
+from src.tools import memory_extract as mx
 from src.tools.source_credibility import (
     build_market_table,
     classify_source,
@@ -603,20 +613,154 @@ def fetch_literature_grounded(topic: str, limit: int = 15):
     return raw_ctx, "+".join(dict.fromkeys(used_sources)), kept, warn
 
 
+def _cmd_memory(topic: str, confirm: bool = False) -> int:
+    """记忆库 CLI：list / stats / recall / refresh / add / pending。"""
+    from src.tools import memory_store as _ms
+
+    op = (topic or "").strip()
+    low = op.lower()
+
+    if low in ("list", "ls"):
+        items = _ms.list_entries(status=None)
+        if not items:
+            print("记忆库为空。可用 `--mode memory --topic \"refresh\"` 从会话日志自动提炼。")
+            return 0
+        for e in items:
+            flag = {"active": "生效", "superseded": "已取代",
+                    "rejected": "已否决", "draft": "草稿"}[e.status]
+            print(f"[{e.id}|{e.kind}|{flag}] {e.title}")
+        print(f"\n共 {len(items)} 条。编辑文件：{_ms.ENTRIES_DIR}")
+        return 0
+
+    if low in ("stats", "stat"):
+        s = _ms.stats()
+        print("记忆库统计：")
+        print(f"  总条目 {s['total']}"
+              f"（领域 {s['domain']} / 偏好 {s['user']} / 在办 {s['project']}）")
+        print(f"  生效 {s['active']}｜已取代 {s['superseded']}"
+              f"｜已否决 {s['rejected']}｜草稿 {s['draft']}")
+        print(f"  会话日志 {s['daily_files']} 篇｜待审提案：{'有' if s['pending'] else '无'}")
+        print(f"  目录：{_ms.MEM_DIR}")
+        return 0
+
+    if low == "refresh":
+        content = "\n".join(mx.refresh_from_daily(days=3))
+        if not content.strip():
+            print("最近没有会话日志，无可提炼内容。")
+            return 0
+        cands = mx.extract_candidates(content, source_desc="最近会话日志自动提炼")
+        if not cands:
+            mx._last_error()
+            print("未提炼出候选记忆（或 LLM 不可用）。")
+            return 0
+        res = mx.promote_safe(cands, auto_write=confirm)
+        verb = "已入库" if confirm else "演练"
+        print(f"{verb}：提炼 {len(cands)} 条候选\n")
+        for c in res["accepted"]:
+            tag = "补充" if c.get("_relation") == "supplement" else "全新"
+            print(f"  [{'已入库' if confirm else '可入库'}·{tag}] ({c['kind']}) {c['title']}")
+            print(f"           理由：{c.get('reason', '')[:100]}")
+        for c in res["pending"]:
+            rel = c.get("_relation")
+            why = {"conflict": "口径冲突", "same": "与既有重复", "unknown": "程序判不准"}[rel] \
+                if rel in ("conflict", "same", "unknown") else "待审"
+            print(f"  [待人工裁决·{why}] ({c['kind']}) {c['title']}")
+            print(f"           {c.get('reason', '')[:100]}")
+        if confirm:
+            print(f"\n已写入 {_ms.ENTRIES_DIR}；待裁决 {len(res['pending'])} 条见 {_ms.PENDING_FILE}")
+        else:
+            print("\n以上仅为演练。确认要采纳请加 --confirm 重新运行，"
+                  "或手动编辑 memory/pending.md。")
+        return 0
+
+    if low.startswith("add "):
+        raw = op[4:].strip()
+        if not raw:
+            print("用法：--topic \"add <正文>\"（默认记为 user 偏好，可用 | 分隔标题）")
+            return 1
+        title, _, body = raw.partition("|")
+        if not body:
+            title, body = raw[:30], raw
+        e = _ms.MemoryEntry(
+            kind="user", title=title.strip(), body=body.strip(),
+            source="操作者手动录入", tags=[], status="active",
+        )
+        e = _ms.save_entry(e, archive_reason="manual-add")
+        print(f"已新增记忆 {e.id}：{e.title}")
+        print(f"文件：{e.path}")
+        return 0
+
+    if low == "pending":
+        p = _ms.PENDING_FILE
+        if not p.exists():
+            print("无待审提案。")
+            return 0
+        print(f"待审提案：{p}")
+        print(p.read_text(encoding="utf-8"))
+        return 0
+
+    if low.startswith("log "):
+        raw = op[4:].strip()
+        if not raw:
+            print('用法：--topic "log <本次会话要点>"（换行用 \\n）')
+            return 1
+        p = _ms.append_daily(["- " + ln for ln in raw.split("\\n") if ln.strip()])
+        print(f"已记入会话日志：{p}")
+        print("之后运行 `--mode memory --topic refresh` 可自动从中提炼长期记忆。")
+        return 0
+
+    if low == "pending-clear":
+        ok = _ms.clear_pending()
+        print("已清空待审提案。" if ok else "无待审提案。")
+        return 0
+
+    # 默认：按主题召回
+    items = _ms.recall(op, limit=8)
+    if not items:
+        print(f"记忆库中无与「{op}」相关的条目。")
+        return 0
+    print(f"与「{op}」相关的记忆（{len(items)} 条）：\n")
+    for e in items:
+        badge = {"user": "偏好", "project": "在办", "domain": "领域"}.get(e.kind, e.kind)
+        print(f"[{e.id}|{badge}] {e.title}")
+        for ln in e.body.strip().splitlines():
+            if ln.strip():
+                print(f"    {ln.strip()}")
+        print()
+    return 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="学术前期研究 Agent（论文检索 / 市场调研）")
+    parser = argparse.ArgumentParser(
+        description="学术前期研究 Agent（论文检索 / 市场调研 / 记忆库）")
     parser.add_argument(
         "--mode",
-        choices=["literature", "market"],
+        choices=["literature", "market", "memory"],
         required=True,
-        help="literature=论文检索综述；market=市场/竞品调研",
+        help="literature=论文检索综述；market=市场/竞品调研；memory=记忆库管理",
     )
-    parser.add_argument("--topic", required=True, help="研究主题 / 检索词")
+    parser.add_argument("--topic", required=True,
+                        help="研究主题 / 检索词；memory 模式下支持 list|stats|refresh|add <内容>|pending")
+    parser.add_argument("--confirm", action="store_true",
+                        help="memory refresh 时真正写入记忆库（默认仅演练预览）")
     args = parser.parse_args()
+
+    os.makedirs("reports", exist_ok=True)
+
+    if args.mode == "memory":
+        return _cmd_memory(args.topic, confirm=args.confirm)
 
     llm = get_llm()
     tools = [literature_search, openalex_search, crossref_search, web_search]
     os.makedirs("reports", exist_ok=True)
+
+    # 记忆召回：与主题相关的长期偏好/约定注入 Crew（无记忆时为空串，不影响主流程）
+    mem_block = build_memory_block(args.topic, limit=8)
+    if mem_block:
+        n = len(ms.recall(args.topic, limit=8))
+        print(f"[记忆] 召回 {n} 条相关记忆，已注入分析上下文")
+    else:
+        print("[记忆] 无相关记忆，按通用方式处理")
 
     if args.mode == "literature":
         # 1) 真实检索：可溯源铁律的基准数据（由代码持有，LLM 不碰）
@@ -641,7 +785,8 @@ def main():
 
         # 2) 注入真实结果运行 Crew（只做分析，不生成文献表）
         print("[2/3] 正在运行 CrewAI 三角色分析（通常 2-5 分钟，请耐心等待）...")
-        crew = build_literature_crew(args.topic, llm, tools, search_results=raw)
+        crew = build_literature_crew(args.topic, llm, tools, search_results=raw,
+                                     memory=mem_block)
         crew.kickoff()
 
         # 3) 后处理：剥离可能伪造的 TSV，追加真实 TSV
@@ -729,7 +874,8 @@ def main():
         market_ctx = "\n".join(ctx_lines)
 
         print("[3/3] 正在运行 CrewAI 三角色分析...")
-        crew = build_market_crew(args.topic, llm, tools, search_results=market_ctx)
+        crew = build_market_crew(args.topic, llm, tools, search_results=market_ctx,
+                                 memory=mem_block)
         crew.kickoff()
 
         # 可溯源护栏：剥离撰稿员可能凭记忆编造的链接（不在真实检索结果内）
