@@ -30,7 +30,7 @@ _TIER_A_DOMAIN = (
     "mdpi.com", "acs.org", "ieee.org",
 )
 
-# B 级：主流科技 / 商业媒体
+# B 级：主流科技 / 商业媒体 / 行业研究 / 财经门户
 _TIER_B_DOMAIN = (
     "36kr.com", "kr36.com", "tmtpost.com", "jiemian.com", "yicai.com",
     "thepaper.cn", "huxiu.com", "infoq.cn", "segmentfault.com",
@@ -38,6 +38,13 @@ _TIER_B_DOMAIN = (
     "engadget.com", "gizmodo.com", "zdnet.com", "cnet.com",
     "forbes.com", "bloomberg.com", "reuters.com", "ft.com",
     "medium.com", "substack.com", "github.com",
+    # 中文财经 / 产经门户
+    "cet.com.cn", "cs.com.cn", "stcn.com", "cnstock.com", "eastmoney.com",
+    # 行业 / 市场研究报告机构（管道检测机器人市场规模、CAGR 等）
+    "pmarketresearch.com", "datainsightsmarket.com", "datainsightsreports.com",
+    "grandviewresearch.com", "marketsandmarkets.com", "mordorintelligence.com",
+    "fortunebusinessinsights.com", "globenewswire.com", "prnewswire.com",
+    "businesswire.com",
 )
 
 # C 级：社区 / 论坛
@@ -95,10 +102,19 @@ def classify_source(url: str, title: str = "", snippet: str = "") -> str:
     if any(d in host for d in _TIER_C_DOMAIN):
         return "C"
 
-    # 启发式：路径含官方栏目且域名较短，可能是企业官网
+    # 启发式①：路径含官方栏目且域名较短，可能是企业官网
     path = urlparse(low).path or ""
     if any(h in path for h in _OFFICIAL_PATH_HINT) and "." not in host.split("/")[0]:
         # 无子域的短域名 + 官方栏目 → 可能是官网
+        return "B"
+
+    # 启发式②：企业官网首页（根路径 / index）。
+    # 不带子域的裸域名（如 bominwell.com、cctv-robot.com）且访问的是首页，
+    # 通常是厂商官方站点，按 B 级（较可信）处理。
+    # 排除带子域的聚合/社区（b2b.baidu.com、shop.xxx 等）与已知 C 级站点。
+    _HOME_PATHS = ("", "/", "/index.html", "/index.htm", "/index.php", "/index.aspx")
+    host_naked = host.split("/")[0]
+    if path in _HOME_PATHS and host_naked.count(".") <= 1 and host_naked not in _TIER_C_DOMAIN:
         return "B"
 
     # 未知来源：默认 C（参考级），由报告标注"来源不明"
@@ -127,6 +143,9 @@ _KNOWN_VENDORS = (
     "西门子", "施耐德", "罗克韦尔", "ABB", "艾默生", "横河电机",
     "赛莱默", "哈希", "海德立", "中持股份", "碧水源", "清控环境",
     "北控水务", "首创环保", "重庆水务", "瀚蓝环境",
+    # 排水管道检测机器人领域厂商（实测检索中高频出现，加入以提升抽取准确度）
+    "博铭维", "中仪物联", "施罗德", "九泰", "快通", "新业环保", "东熙汇通",
+    "固德超前", "华璟环保", "哈工智灵", "中岩科技",
 )
 
 # 功能关键词（用于抽产品定位）

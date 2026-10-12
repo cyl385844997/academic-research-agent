@@ -264,8 +264,14 @@ def parse_web_results(raw: str):
         url = url.strip()
         snippet = ""
         nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        # 兼容两种格式：
+        #   - 工具显式输出「摘要:...」（旧约定）
+        #   - 工具输出普通缩进续行（ddgs / Tavily 实际返回，无「摘要:」前缀）
+        # 凡下一条非新条目（不以 "- " 开头）且非空，均视作本条摘要。
         if nxt.startswith("摘要:"):
             snippet = nxt[len("摘要:"):].strip()
+        elif nxt and not nxt.startswith("- "):
+            snippet = nxt
         if url.startswith("http"):
             items.append({"title": title.strip(), "url": url, "snippet": snippet})
     return items
