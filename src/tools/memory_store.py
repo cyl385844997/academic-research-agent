@@ -11,6 +11,10 @@
 4. **冲突熔断**：新记忆与既有记忆 `topic_key` 相同但结论相悖 → 标记 conflict 交人工裁决，
    程序不自动择一（对齐「同一事实多处置入不一致时立即停止修改」纪律）。
 5. **local-first**：全部落本地磁盘，`.gitignore` 排除，不上传任何服务。
+6. **时效与复审**：记忆带 TTL（按 kind 分级：user 90 天 / project 30 天 / domain 365 天）。
+   过期**不等于淘汰**，只降权（×0.45）并在注入时标注「久未确认 N 天」，
+   由 `memory/review.md` 清单人工复审。召回时自动给未过期条目续期，
+   使「用得越多的记忆越不容易过期」。详见 `_age` 一节与 `staleness()`。
 
 文件格式（可直接手改）::
 
@@ -21,10 +25,13 @@
     tags: [排水管网, 高水位]
     topic_key: 高水位        # 同一 topic_key 的两条记忆若结论相悖 → 冲突
     status: active          # active / superseded / rejected / draft
-    always: false           # true = 每次都注入，不做相关性筛选
+    always: false           # true = 每次都注入，不做相关性筛选（但仍受 TTL 降权）
     source: 2026-10-12 对话（用户纠正）
     created: 2026-10-12T09:00:00
     updated: 2026-10-12T09:00:00
+    confirmed: 2026-10-12T09:00:00   # 上次确认「仍然成立」，TTL 计时基准
+    confirm_reason: 人工复审          # 人工复审 / 召回时确认
+    ttl_days: 0                       # 0 = 用该 kind 的默认 TTL
     ---
 
     正文（Markdown）。第一句通常是可执行的结论，便于召回时一眼判断相关性。
@@ -51,6 +58,7 @@ ENTRIES_DIR = MEM_DIR / "entries"
 DAILY_DIR = MEM_DIR / "daily"
 ARCHIVE_DIR = MEM_DIR / "archive"
 PENDING_FILE = MEM_DIR / "pending.md"
+REVIEW_FILE = MEM_DIR / "review.md"
 
 VALID_KINDS = ("domain", "user", "project")
 VALID_STATUS = ("active", "superseded", "rejected", "draft")
@@ -60,6 +68,31 @@ SIM_DUPLICATE = 0.85   # ≥ 此值视为重复，自动合并
 SIM_RELATED = 0.55      # ≥ 此值视为相关，列入待审并建议合并
 
 _KIND_PREFIX = {"domain": "M", "user": "U", "project": "P"}
+
+# ============ TTL 与复审 ============
+#
+# 为什么需要：偏好会变（「以后给我 TSV」半年后可能改成 xlsx）。
+# 原实现里 _score() 只看词面重合度、**完全没有时间项**，
+# 于是「6 个月前写的旧偏好」与「昨天确认的新偏好」在召回时完全等价，
+# 甚至旧条目会因 `always=true` 或 `kind=user` 的加权压过新条目。
+#
+# 设计原则（重要）：**过期 = 降权 + 提示复审，而不是淘汰**。
+# 半年后改成 xlsx 很可能只是那一个项目的要求，不是永久偏好；
+# 自动删除会误伤。所有超期项一律进「复审」流程，仍可用但不主导打分。
+#
+# TTL 按 kind 分级：
+#   user    操作者偏好 —— 最容易变（口味、交付格式），TTL 最短
+#   project 在办事项   —— 天然会过期，但**不自动降权**，改由人工归档
+#   domain  领域知识   —— 术语口径、技术路线这类事实最稳定，TTL 最长
+
+TTL_DAYS = {"user": 90, "domain": 365, "project": 30}
+
+# 超期后的降权系数（乘在打分上）。刻意保留 0.45 这个下限：
+# 过期记忆仍应能被召回，但不会盖过新鲜且高度相关的内容。
+STALE_FACTOR = 0.45
+
+# 超过 TTL 多少倍后视为「深度过期」，在注入时显式标注天数。
+STALE_DEEP_MULTIPLIER = 2.0
 
 
 # ============ 基础设施 ============
@@ -102,6 +135,21 @@ def _split_frontmatter(raw: str) -> tuple[dict, str]:
     return meta, m.group(2).strip()
 
 
+# ============ 文本清洗 ============
+
+_LIST_MARK = re.compile(r"^\s*(?:[-*+>\u2022]|\d+[.)\u3001])\s+")
+
+
+def _strip_marker(line: str) -> str:
+    """剥掉 Markdown 列表标记 / 编号前缀，**保留正文原样**。
+
+    不用 `lstrip(chars)`——它按字符集剥离，会把 "1.5 吨" 的 "1." 一并吃掉，
+    把数字开头的正常句子毁成 "5 吨"。这里改用正则只匹配列表标记本身。
+    """
+    out = _LIST_MARK.sub("", (line or "").strip())
+    return out.strip()
+
+
 # ============ 数据模型 ============
 
 @dataclass
@@ -116,6 +164,10 @@ class MemoryEntry:
     source: str = ""
     created: str = ""
     updated: str = ""
+    # ---- 时效字段（2026-10-12 新增）----
+    confirmed: str = ""          # 上次确认「仍然成立」的时间，TTL 计时基准
+    confirm_reason: str = ""     # 确认方式：人工复审 / 召回时确认
+    ttl_days: int = 0            # 覆盖该 kind 的默认 TTL；0 = 用默认值
     body: str = ""
 
     @property
@@ -138,6 +190,9 @@ class MemoryEntry:
             "source": self.source,
             "created": self.created,
             "updated": self.updated,
+            "confirmed": self.confirmed,
+            "confirm_reason": self.confirm_reason,
+            "ttl_days": self.ttl_days,
         }
         fm = yaml.safe_dump(
             meta, allow_unicode=True, sort_keys=False, default_flow_style=False
@@ -151,7 +206,7 @@ class MemoryEntry:
         """召回注入时用的紧凑摘要：标题 + 正文首句。"""
         first = ""
         for line in self.body.strip().splitlines():
-            line = line.strip().lstrip("-*0123456789. ").strip()
+            line = _strip_marker(line)
             if line and not line.startswith("#"):
                 first = line
                 break
@@ -178,6 +233,9 @@ def _entry_from_file(path: Path) -> Optional[MemoryEntry]:
         source=str(meta.get("source", "") or ""),
         created=str(meta.get("created", "") or ""),
         updated=str(meta.get("updated", "") or ""),
+        confirmed=str(meta.get("confirmed", "") or ""),
+        confirm_reason=str(meta.get("confirm_reason", "") or ""),
+        ttl_days=int(meta.get("ttl_days", 0) or 0),
         body=body,
     )
 
@@ -222,6 +280,10 @@ def save_entry(entry: MemoryEntry, archive_reason: str = "update") -> MemoryEntr
     entry.updated = _now()
     if not entry.created:
         entry.created = entry.updated
+    # 首次入库即视为「已确认」：TTL 从入库那一刻起算，而不是从零。
+    # 后续 update 若未显式给出 confirmed，保留旧值（内容没变，确认时间也不该变）。
+    if not entry.confirmed:
+        entry.confirmed = entry.created
     if entry.kind not in VALID_KINDS:
         entry.kind = "domain"
     if entry.status not in VALID_STATUS:
@@ -382,6 +444,99 @@ def list_daily(limit: int = 10) -> list:
     return sorted(DAILY_DIR.glob("*.md"), reverse=True)[:limit]
 
 
+# ============ 时效（TTL / 过期） ============
+
+def _parse_dt(s: str) -> Optional[datetime]:
+    """解析 frontmatter 里的时间戳；解析不了返回 None（不报错）。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s[:19] if fmt != "%Y-%m-%d" else s[:10], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def ttl_days(entry: MemoryEntry) -> int:
+    """该条目的 TTL（天）。可用条目自带 ttl_days 覆盖默认值。"""
+    return entry.ttl_days if entry.ttl_days else TTL_DAYS.get(entry.kind, 365)
+
+
+def age_days(entry: MemoryEntry, now: Optional[datetime] = None) -> Optional[int]:
+    """距上次确认过去了多少天。优先用 `confirmed`，退回 `updated`，再退回 `created`。
+
+    返回 None 表示三个时间戳都缺失——此时**不施加任何降权**，
+    因为无法判定新旧时，宁可保持原状也不要凭空压低一条记忆的权重。
+    """
+    now = now or datetime.now()
+    for ts in (entry.confirmed, entry.updated, entry.created):
+        dt = _parse_dt(ts)
+        if dt:
+            return max(0, (now - dt).days)
+    return None
+
+
+def staleness(entry: MemoryEntry, now: Optional[datetime] = None) -> dict:
+    """判断一条记忆的时效状态，供打分降权、注入标注、复审扫描共用。"""
+    age = age_days(entry, now)
+    ttl = ttl_days(entry)
+    if age is None:
+        return {"age": None, "ttl": ttl, "stale": False, "deep": False, "factor": 1.0}
+    stale = age > ttl
+    deep = stale and age > ttl * STALE_DEEP_MULTIPLIER
+    return {
+        "age": age,
+        "ttl": ttl,
+        "stale": stale,
+        "deep": deep,
+        "factor": STALE_FACTOR if stale else 1.0,
+    }
+
+
+def touch(entry_id: str, reason: str = "召回时确认") -> Optional[MemoryEntry]:
+    """续期：把某条记忆标记为「本次任务中仍然成立」，重置 TTL 计时。
+
+    这是复审的**自动**一半：被召回且本次仍然适用的记忆会自动续期，
+    于是「用得越多越不容易过期」，复审成本由实际使用频率承担。
+    人工复审走 `confirm_entry()`。
+    """
+    e = get_entry(entry_id)
+    if not e:
+        return None
+    ts = _now()
+    e.confirmed = ts
+    e.confirm_reason = reason
+    # 直接写文件而不走 save_entry()：续期不是内容变更，
+    # 不该在 archive/ 里堆出一份内容完全相同的副本。
+    _ensure_dirs()
+    _atomic_write(e.path, e.to_markdown())
+    return e
+
+
+def confirm_entry(entry_id: str, reason: str = "人工复审") -> Optional[MemoryEntry]:
+    """人工确认：同 touch，但语义上区分「人确认过」与「召回时自动续期」。"""
+    return touch(entry_id, reason=reason)
+
+
+def list_stale(kind: Optional[str] = None) -> list:
+    """列出所有超期记忆（含未超期但深度超期的），按超期程度降序。
+
+    供 `--mode memory stale` 展示与 `--mode memory review` 批量复审使用。
+    """
+    now = datetime.now()
+    out = []
+    for e in list_entries(status="active"):
+        if kind and e.kind != kind:
+            continue
+        st = staleness(e, now)
+        if st["stale"]:
+            out.append((st["age"] / max(1, st["ttl"]), st, e))
+    out.sort(key=lambda x: (-x[0], x[2].id))
+    return [(st, e) for _r, st, e in out]
+
+
 # ============ 召回 ============
 
 def _tokens(text: str) -> set:
@@ -399,7 +554,9 @@ def _tokens(text: str) -> set:
 
 def _score(entry: MemoryEntry, topic: str, topic_tokens: set) -> float:
     if entry.always:
-        return 100.0
+        # always=true 也必须过一遍降权：否则一条 N 个月前设的 always
+        # 会永久压制同主题的新记忆，「always」就变成了「永不过期」。
+        return 100.0 * staleness(entry)["factor"]
     s = 0.0
     et = _tokens(entry.searchable_text())
     if topic_tokens and et:
@@ -411,11 +568,18 @@ def _score(entry: MemoryEntry, topic: str, topic_tokens: set) -> float:
             s += 1.5
     if entry.kind == "user":
         s += 0.8   # 操作者偏好略微加权：影响每一次交付
-    return s
+    return s * staleness(entry)["factor"]
 
 
-def recall(topic: str, limit: int = 8, kinds: Optional[list] = None) -> list:
-    """按与 topic 的相关性召回记忆，返回 MemoryEntry 列表（已排序、已去重）。"""
+def recall(topic: str, limit: int = 8, kinds: Optional[list] = None,
+           auto_confirm: bool = False) -> list:
+    """按与 topic 的相关性召回记忆，返回 MemoryEntry 列表（已排序、已去重）。
+
+    `auto_confirm=True` 时，被召回且未超期的条目会自动续期（`confirmed` 重置为
+    现在）——即「本次任务里这条偏好仍然适用」。这让**用得越多的记忆越不容易
+    过期**，复审成本由实际使用频率承担，而不是靠定时器全表扫描。
+    超期条目不自动续期：它们必须先经过人工或 LLM 复审。
+    """
     entries = list_entries(status="active")
     if kinds:
         entries = [e for e in entries if e.kind in kinds]
@@ -423,7 +587,12 @@ def recall(topic: str, limit: int = 8, kinds: Optional[list] = None) -> list:
     scored = [(_score(e, topic or "", tt), e) for e in entries]
     scored = [(s, e) for s, e in scored if s > 0]
     scored.sort(key=lambda x: (-x[0], x[1].id))
-    return [e for _s, e in scored[:limit]]
+    picked = [e for _s, e in scored[:limit]]
+    if auto_confirm:
+        for e in picked:
+            if not staleness(e)["stale"]:
+                touch(e.id, reason="召回时确认")
+    return picked
 
 
 def build_memory_block(topic: str, limit: int = 8, kinds: Optional[list] = None) -> str:
@@ -432,9 +601,10 @@ def build_memory_block(topic: str, limit: int = 8, kinds: Optional[list] = None)
     本函数自带标题（`## 长期记忆`），调用方只需把返回值拼进提示词，
     不要重复再加标题——否则同一块内容会出现两个层级标题。
     """
-    items = recall(topic, limit=limit, kinds=kinds)
+    items = recall(topic, limit=limit, kinds=kinds, auto_confirm=True)
     if not items:
         return ""
+    stale = [e for e in items if staleness(e)["stale"]]
     lines = [
         "## 长期记忆（必须遵守，优先于你的通用写作习惯）",
         "",
@@ -442,13 +612,23 @@ def build_memory_block(topic: str, limit: int = 8, kinds: Optional[list] = None)
         "与你的默认习惯冲突时以此为准。）",
         "",
     ]
+    if stale:
+        lines += [
+            f"⚠️ 下列 {len(stale)} 条记忆标注「久未确认」，可能已不适用于当前偏好，"
+            "以本次明确指令为准；若与指令冲突，按指令执行。",
+            "",
+        ]
     for e in items:
         badge = {"user": "偏好", "project": "在办", "domain": "领域"}.get(e.kind, e.kind)
-        lines.append(f"- **{badge}｜{e.title or e.one_line()}**（{e.id}）")
+        st = staleness(e)
+        mark = ""
+        if st["stale"] and st["age"] is not None:
+            mark = f"　[久未确认：{st['age']} 天前]"
+        lines.append(f"- **{badge}｜{e.title or e.one_line()}**（{e.id}）{mark}")
         for ln in e.body.strip().splitlines():
-            ln = ln.strip()
+            ln = _strip_marker(ln)
             if ln:
-                lines.append(f"  - {ln.lstrip('-*0123456789. ')}")
+                lines.append(f"  - {ln}")
     return "\n".join(lines) + "\n"
 
 
@@ -495,6 +675,54 @@ def clear_pending() -> bool:
     return False
 
 
+def build_review_queue() -> list:
+    """生成复审清单：所有超期记忆 + 各自的确认时间与超期倍数。
+
+    供 `--mode memory stale` 展示，也供 `write_review_file()` 落盘。
+    """
+    return [(st, e) for st, e in list_stale()]
+
+
+def write_review_file() -> Optional[Path]:
+    """把复审清单写到 `memory/review.md`，供人工逐条处置。
+
+    与 `pending.md`（入库前的新提案）**刻意分成两个文件**：
+      - pending.md = 还没进库，等你决定要不要收
+      - review.md  = 已经生效过、但久未确认，等你决定还留不留
+    混在一个文件里，操作者分不清「这条到底生效了没」。
+    """
+    items = build_review_queue()
+    if not items:
+        return None
+    _ensure_dirs()
+    lines = [
+        "# 记忆复审清单",
+        "",
+        "> 这些记忆**当前仍在生效**，但已超过各自的 TTL，久未确认。",
+        "> 处置方式：",
+        ">   1. 仍然成立 → 在条目文件里把 `confirmed` 改成当前时间（或跑 "
+        "`--mode memory confirm <ID>`）",
+        ">   2. 已被新偏好取代 → `--mode memory drop <ID>`（转归档，不删）",
+        ">   3. 只是想改内容 → 直接编辑该条目文件",
+        "",
+        f"生成时间：{_now()}",
+        "",
+        "| ID | 类型 | 标题 | 上次确认 | 已有 | TTL | 超期 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for st, e in items:
+        last = (e.confirmed or e.updated or e.created or "未知")
+        last_s = last[:10]
+        over = f"{st['age'] / max(1, st['ttl']):.1f}×"
+        lines.append(
+            f"| {e.id} | {e.kind} | {e.title or e.one_line()} | {last_s} | "
+            f"{st['age']} 天 | {st['ttl']} 天 | {over} |"
+        )
+    lines.append("")
+    _atomic_write(REVIEW_FILE, "\n".join(lines) + "\n")
+    return REVIEW_FILE
+
+
 def stats() -> dict:
     """记忆库统计，供 `--mode memory stats` 展示。"""
     all_e = list_entries(status=None)
@@ -505,4 +733,7 @@ def stats() -> dict:
         out[s] = sum(1 for e in all_e if e.status == s)
     out["daily_files"] = len(list(DAILY_DIR.glob("*.md"))) if DAILY_DIR.exists() else 0
     out["pending"] = PENDING_FILE.exists()
+    stale = list_stale()
+    out["stale"] = len(stale)
+    out["review_file"] = REVIEW_FILE.exists()
     return out

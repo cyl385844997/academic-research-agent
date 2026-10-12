@@ -103,6 +103,100 @@ def main():
     check("删除后不在生效列表", ok and all(x.id != e_always.id for x in ms.list_entries()))
     check("删除后归档可回溯", len(list(ms.ARCHIVE_DIR.glob(f"{e_always.id}-*/*.md"))) >= 1)
 
+    print("\n=== 文本清洗（_strip_marker） ===")
+    cases = [
+        ("1.5 吨水电耗降低", "1.5 吨水电耗降低"),
+        ("- 交付 TSV", "交付 TSV"),
+        ("* 要点一", "要点一"),
+        ("2026.9 月提交", "2026.9 月提交"),
+        ("1) 第一项", "第一项"),
+        ("普通正文行", "普通正文行"),
+    ]
+    for src, exp in cases:
+        check(f"_strip_marker({src!r})", ms._strip_marker(src) == exp,
+              f"got {ms._strip_marker(src)!r}")
+
+    print("\n=== TTL 与复审 ===")
+    from datetime import datetime, timedelta
+    now = datetime.now()
+
+    def aged(kind, days, **kw):
+        """造一条「N 天前确认过」的记忆。"""
+        e = ms.MemoryEntry(kind=kind, title=kw.pop("title", "测试"),
+                           body=kw.pop("body", "正文"), tags=[], status="active", **kw)
+        ts = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        e.created = e.updated = e.confirmed = ts
+        return e
+
+    fresh_u = aged("user", 10, title="偏好新鲜")
+    old_u = aged("user", 200, title="偏好过期")
+    old_d = aged("domain", 200, title="领域过期")
+    no_ts = ms.MemoryEntry(kind="user", title="无时间戳", body="正文")
+    no_ts.created = no_ts.updated = no_ts.confirmed = ""
+
+    check("user TTL = 90 天", ms.ttl_days(fresh_u) == 90, ms.ttl_days(fresh_u))
+    check("domain TTL = 365 天", ms.ttl_days(old_d) == 365, ms.ttl_days(old_d))
+    check("10 天未超期", ms.staleness(fresh_u)["stale"] is False)
+    check("200 天超期", ms.staleness(old_u)["stale"] is True)
+    check("超期降权系数生效", abs(ms.staleness(old_u)["factor"] - 0.45) < 1e-6,
+          ms.staleness(old_u)["factor"])
+    check("未超期不降权", ms.staleness(fresh_u)["factor"] == 1.0)
+    check("无时间戳不降权", ms.staleness(no_ts)["factor"] == 1.0)
+    check("无时间戳不判过期", ms.staleness(no_ts)["stale"] is False)
+    check("200 天超 2×TTL 视为深度过期", ms.staleness(old_u)["deep"] is True)
+
+    # always=true 也必须降权，否则久远的 always 会永久压制新记忆
+    always_old = aged("user", 300, title="always 过期")
+    always_old.always = True
+    s_old = ms._score(always_old, "偏好过期", ms._tokens("偏好过期"))
+    check("always 条目同样受降权", s_old < 100.0, s_old)
+
+    check("ttl_days 可被条目覆盖",
+          ms.ttl_days(ms.MemoryEntry(kind="user", ttl_days=7)) == 7)
+    check("_parse_dt 容忍空值", ms._parse_dt("") is None)
+    check("_parse_dt 解析日期", ms._parse_dt("2026-10-12") is not None)
+
+    # 复审清单：只收超期项，且 review.md 与 pending.md 分开
+    from pathlib import Path as _P
+    _ttl_tmp = _P(tmp)
+    saved_dir, ms.ENTRIES_DIR = ms.ENTRIES_DIR, _ttl_tmp / "ttl_entries"
+    _ttl_tmp.mkdir(parents=True, exist_ok=True)
+    ms.save_entry(old_u, "ttl-test")
+    ms.save_entry(fresh_u, "ttl-test")
+    q = ms.build_review_queue()
+    check("复审清单只含超期项", len(q) == 1 and q[0][1].id == old_u.id,
+          [e.id for _st, e in q])
+    rp = ms.write_review_file()
+    check("review.md 已生成", rp is not None and rp.exists())
+    check("review.md 提及超期条目", old_u.id in rp.read_text(encoding="utf-8"))
+    check("review.md 不含未超期条目", fresh_u.id not in rp.read_text(encoding="utf-8"))
+    check("review.md 与 pending.md 是两个文件", rp != ms.PENDING_FILE)
+
+    # confirm 重置 TTL 计时
+    before = ms.age_days(ms.get_entry(old_u.id))
+    ms.confirm_entry(old_u.id)
+    after = ms.age_days(ms.get_entry(old_u.id))
+    check("confirm 后龄期归零", after is not None and after <= 1, f"{before} -> {after}")
+    check("confirm 后不再超期",
+          ms.staleness(ms.get_entry(old_u.id))["stale"] is False)
+    check("confirm 写入确认方式",
+          "人工复审" in (ms.get_entry(old_u.id).confirm_reason or ""))
+
+    # 召回自动续期：未超期条目 touch，超期条目不 touch
+    fresh_before = ms.age_days(ms.get_entry(fresh_u.id))
+    old_aged = aged("user", 200, title="超期不续期")
+    ms.save_entry(old_aged, "ttl-test")
+    ms.recall("测试 偏好", auto_confirm=True)
+    # 注意：续期后龄期为 0，不能写 `age or 默认值`——0 是假值会被误判成"失败"
+    _age_after = ms.age_days(ms.get_entry(fresh_u.id))
+    check("召回时未超期条目被续期",
+          _age_after is not None and _age_after <= 1, f"{fresh_before} -> {_age_after}")
+    check("召回时超期条目不自动续期",
+          (ms.age_days(ms.get_entry(old_aged.id)) or 0) > 100)
+
+    ms.ENTRIES_DIR = saved_dir
+    ms.REVIEW_FILE = _ttl_tmp / "review.md"
+
     print("\n=== 统计 ===")
     s = ms.stats()
     check("统计可用", s["total"] >= 1, s)
