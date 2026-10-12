@@ -11,5 +11,9 @@ reports/*
 memory/*
 !memory/.gitkeep
 !memory/README.md
+# 我方条件（company_profile）真实文件：含公司能力、商业模式、约束、
+# 历史判断，属商业敏感信息。仅模板 example 入库，真实文件绝不可公开。
+knowledge/company_profile.yaml
+knowledge/company_profile.yml
 *.log
 .DS_Store
