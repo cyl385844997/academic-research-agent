@@ -117,16 +117,35 @@ def assess_quality(papers, topic="", en_topic=""):
     if en_topic:
         en_topic_words = set(re.findall(r"[a-z]{3,}", en_topic.lower()))
 
+    # 中文相关性必须按**子串包含**判定，不能用「整段连续汉字」的 token 交集。
+    # 实测 bug（2026-10-13）：`tokens()` 的中文正则是最大连续汉字串，
+    # 主题「排水管网高水位状态下的检测与诊断」与标题「城镇排水管道高水位运行诊断方法」
+    # 的 token 交集恒为空 → 发表在《中国给水排水》（北大核心）的论文被判
+    # 「主题不相关」剔除。实测后果：知网召回 12 篇中文只剩 1 篇学位论文
+    # （学位论文走的是另一条豁免分支，与本bug 无关）。
+    # 改为：主题的 2 字滑窗子串有一个出现在标题中即判相关；
+    # 中文另有「北大核心白名单」这道主闸门兜底，判定宽松不会放进灌水刊。
+    zh_grams = set()
+    for _run in topic_cn:
+        for _i in range(len(_run) - 1):
+            zh_grams.add(_run[_i:_i + 2])
+
+    def zh_relevant(title: str) -> bool:
+        """中文标题是否与检索主题相关（2 字子串包含判定）。"""
+        if not zh_grams:
+            return True
+        t = title or ""
+        return any(g in t for g in zh_grams)
+
     def relevant(title: str, lang: str) -> bool:
         """判断标题是否与检索词相关。
 
         **按语种分别比对**：中英混写的检索词里，中文文献不可能包含
         "sewer/pipeline" 等英文词，反之亦然；跨语种比对会误杀全部中文文献。
         """
-        t_cn, t_en = tokens(title)
         if lang == "zh":
-            return (not topic_cn) or bool(topic_cn & t_cn)
-        return (not topic_en) or bool(topic_en & t_en)
+            return zh_relevant(title)
+        return (not topic_en) or bool(topic_en & tokens(title)[1])
 
     for p in papers:
         lang = p.get("lang", "en")
@@ -142,8 +161,8 @@ def assess_quality(papers, topic="", en_topic=""):
             if not _is_core_journal(venue):
                 dropped.append((p, f"非北大核心期刊（{venue or '未标注'}）"))
                 continue
-            # 核心刊也可能跑题，仍做相关性校验
-            if topic_cn and not (topic_cn & tokens(p.get("title", ""))[0]):
+            # 核心刊也可能跑题，仍做相关性校验（中文按 2 字子串包含判定，见上）
+            if not zh_relevant(p.get("title", "")):
                 dropped.append((p, "主题不相关"))
                 continue
             kept.append(p)
@@ -158,10 +177,41 @@ def assess_quality(papers, topic="", en_topic=""):
             continue
         kept.append(p)
 
-    warn = None
+    warn_lines = []
+
+    # 1)剔除明细：**始终**输出原因分布与样例。
+    #    实测踩过的坑（2026-10-12）：知网召回 12 篇中文，最终只留 1 篇，
+    #    而原实现只把 dropped 收集起来、从不对外输出，阈值预警又够不着
+    #    （11/103≈10.7% < 50%），整条链路全程无声——中文召回塌方看不见。
+    if dropped:
+        stat = {}
+        for _p, reason in dropped:
+            key = reason.split("（")[0]
+            stat[key] = stat.get(key, 0) + 1
+        detail = "；".join(f"{k} {v} 条"
+                           for k, v in sorted(stat.items(), key=lambda kv: -kv[1]))
+        warn_lines.append(
+            f"📋 质量过滤明细：剔除 {len(dropped)}/{len(papers)} 条 —— {detail}")
+        warn_lines.append("   样例：" + "；".join(
+            f"《{(p.get('title') or '未命名')[:18]}》{r}" for p, r in dropped[:3]))
+
+    # 2) 中文专项：中文剔除即使还有留存也要报，否则「12 篇只剩 1 篇」不可见
+    zh_dropped = [(p, r) for p, r in dropped if p.get("lang") == "zh"]
+    if zh_dropped:
+        zstat = {}
+        for _p, reason in zh_dropped:
+            key = reason.split("（")[0]
+            zstat[key] = zstat.get(key, 0) + 1
+        zdetail = "；".join(f"{k} {v} 篇"
+                            for k, v in sorted(zstat.items(), key=lambda kv: -kv[1]))
+        warn_lines.append(
+            f"⚠️ 中文文献剔除 {len(zh_dropped)} 篇（{zdetail}）——"
+            f"免费库中文部分以付费灌水刊为主，属数据源限制而非程序缺陷；"
+            f"建议按项目文档的「人工补检知网」流程补齐核心刊文献")
+
     n_zh_kept = sum(1 for p in kept if p["lang"] == "zh")
     if not n_zh_kept and any(p["lang"] == "zh" for p in papers):
-        warn = (
+        warn_lines.append(
             f"⚠️ 中文文献全部被过滤：检索到的中文记录均不在北大核心期刊白名单内"
             f"（共剔除 {sum(1 for p in papers if p['lang'] == 'zh')} 篇）。\n"
             f"原因：中文免费库（尤其 Crossref 中文部分）以付费灌水刊为主。\n"
@@ -170,14 +220,15 @@ def assess_quality(papers, topic="", en_topic=""):
             f"③ 或换用核心刊常见的主题词（如「城镇污水处理」「排水管网」）。"
         )
     elif not kept:
-        warn = (
+        warn_lines.append(
             f"⚠️ 检索到的 {len(dropped)} 条记录全部被过滤。建议更换检索关键词。"
         )
     elif len(dropped) / max(len(papers), 1) >= 0.5:
-        warn = (
-            f"⚠️ 质量过滤：{len(dropped)}/{len(papers)} 条被剔除"
+        warn_lines.append(
+            f"⚠️ 质量过滤比例偏高：{len(dropped)}/{len(papers)} 条被剔除"
             f"（中文按北大核心白名单，英文按主题相关性）。"
         )
+    warn = "\n".join(warn_lines) if warn_lines else None
     return kept, warn
 from src.tools.web_tool import web_search, search_web
 
