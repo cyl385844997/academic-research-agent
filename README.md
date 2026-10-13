@@ -39,7 +39,7 @@
 |---|---|
 | 早期版本让 LLM 自己生成文献表 | 出现「真实 DOI 指向完全不同的论文」「DOI 根本不存在」 |
 | 仅 URL 闸口、引用层无闸口（2026-10-12 前） | 文献综述正文 51 个引用中 **50 个是编造的**，仅 1 个能溯源 |
-| 补上 DOI 闸口 + 去掉「检索员」角色后重跑 | 正文 108 处引用、82 个唯一 DOI，**0 编造**（闸口零剔除） |
+| 补上 DOI 闸口 + 去掉「检索员」角色后重跑 | 正文 108 处引用、74 个不同 DOI，**0 编造**（闸口零剔除，带外核验器复核通过） |
 
 两条结论已固化为红线，写进 `docs/v0.2-spec.md`：
 
@@ -115,11 +115,12 @@
 | 采集 | 学术库结构化接口（四源容错） | 网页检索 + 多维检索式拆解 |
 | 可溯源标准 | DOI 级（无 DOI 则留空并保留期刊+年份） | URL + 抓取日期 + A/B/C 可信度分级 |
 | 质量判据 | 中文按北大核心白名单 | 按来源类型分级，D 级内容农场丢弃 |
-| 谁做分析 | 分析员 → 撰稿员（两角色，无检索员） | 侦察员 → 分析员 → 撰稿员（**已知缺陷，见下**） |
+| 谁做分析 | 分析员 → 撰稿员（两角色，无检索员） | 分析员 → 撰稿员（两角色，2026-10-13 已同款移除侦察员） |
 
-> ⚠️ 市场线 scout 角色在无工具时会角色扮演检索，把不存在的检索写进报告
-> （实测：「检索"排水管网 高水位 政策 文件"返回0条」）。**修掉之前，市场线产物
-> 必须过 `verify_report.py` 核验**，报告中「检索返回 0 条」类断言一律视为未经证实。
+> 侦察员角色已从**两条线**移除（2026-10-13）。此前它在无工具时会角色扮演检索，
+> 把不存在的检索写进报告（实测产物第 36/136 行：「检索"排水管网 高水位 政策 文件"
+> 返回0条」）。**仓库里的 `reports/market_report.md` 是修复前生成的，含该伪造检索，
+> 需重跑市场线后再用**；`verify_report.py` 会持续检出这类措辞。
 
 ### 四级文献源（中英文并行）
 
@@ -140,6 +141,23 @@
 **文献源均无需 API key**（知网需已安装 [cnki-mcp](https://github.com/SepineTam/cnki-mcp) 并完成登录初始化）。
 
 ---
+
+## 当前实际状态（2026-10-13）
+
+按「实测能跑到哪一步」写，不按设计意图写：
+
+| 能力 | 状态 | 实测依据 |
+|---|---|---|
+| 文献检索 `--mode literature` | ✅ 可用 | 「排水管网高水位状态下的检测与诊断」实跑 91 篇（中 1 / 英 90），知网召回 12 篇 |
+| 两道护栏 + 带外核验器 | ✅ 可用 | 修复后报告 108 处引用 / 74 个不同 DOI，**0 越界** |
+| 记忆库 TTL 复审 | ✅ 可用 | 自测 51 项通过 |
+| 市场检索 `--mode market` | ⚠️ 受限 | 需要出网。ddgs 回退走 `search.brave.com`，受限网络下超时；仓库内 `scripts/run_market_real_highwater.py` 是**注入式验证脚本**（内嵌 24 条真实命中），只用于验证链路，**不可当实时检索通道** |
+| 两稿合稿 | ⚠️ 需手动 | 脚本可用（实跑产出 296 行，含交叉讨论与留白结论），但未接入 `main.py` |
+| 中文核心刊召回 | 🔄 待复测 | 2026-10-13 修掉了「核心刊论文被相关性误杀」的缺陷（自测 11 项通过），但修复后真实检索的中文篇数尚未复测 |
+| 现有 `reports/market_report.md` | ⚠️ 需重生成 | 产于 scout 修复前，含伪造检索措辞（第 36 / 136 行） |
+
+实测运行环境：Windows + Python 3.12.10 + crewai 1.15.27。README 建议 3.10~3.12，
+**3.13 未验证**。
 
 ## 快速开始
 
@@ -174,12 +192,18 @@ cp .env.example .env   # 然后编辑 .env 填入你的 API key
 
 ## 配置（.env）
 
-| 变量 | 说明 |
-|------|------|
-| `OPENAI_API_KEY` | LLM 密钥 |
-| `OPENAI_MODEL` | 模型名 |
-| `OPENAI_BASE_URL` | OpenAI 兼容端点（可选）。已验证可用：`https://apihub.agnes-ai.com/v1`、`https://token.sensenova.cn/v1` |
-| `SEMANTIC_SCHOLAR_API_KEY` | 可选，提升文献检索速率 |
+| 变量 | 谁读它 | 说明 |
+|------|---|---|
+| `OPENAI_API_KEY` | `main.get_llm()` | LLM 密钥（必填） |
+| `OPENAI_MODEL` | `main.get_llm()` | 模型名，默认 `gpt-4o-mini` |
+| `OPENAI_BASE_URL` | `main` / `market_query` / `query_translator` / `memory_extract` | OpenAI 兼容端点（可选）。已验证可用：`https://apihub.agnes-ai.com/v1`、`https://token.sensenova.cn/v1` |
+| `SEMANTIC_SCHOLAR_API_KEY` | `literature_tool` | 可选，提升 S2 速率并降低 429 限流 |
+| `TAVILY_API_KEY` | `web_tool` | 可选，市场线的 Web 检索后端；不填则回退 DuckDuckGo（免 key） |
+
+> `.env.example` 中三个变量是默认启用态（`OPENAI_API_KEY` / `OPENAI_MODEL` /
+> `TAVILY_API_KEY`），另两个以注释形式给出（`OPENAI_BASE_URL` 列出三种可选端点、
+> `SEMANTIC_SCHOLAR_API_KEY`），按需取消注释。在受限网络环境下
+> `OPENAI_BASE_URL` 尤其关键——它决定 LLM 能否连通。
 
 > ⚠️ LLM 必须支持 **function calling**（工具调用），CrewAI 的检索工具依赖此能力。
 > 可用 `curl <BASE_URL>/models` 查看端点支持的模型名。
@@ -187,18 +211,44 @@ cp .env.example .env   # 然后编辑 .env 填入你的 API key
 ## 用法
 
 ```bash
-# 文献检索与综述
+# 文献检索与综述（两条线里唯一不依赖外部出网的一条）
 python src/main.py --mode literature --topic "side-stream EBPR wet weather overflow"
+
+# 市场 / 竞品调研（需要能出网，见「当前实际状态」）
+python src/main.py --mode market --topic "排水管网高水位检测"
 
 # 记忆库
 python src/main.py --mode memory --topic "高水位"      # 查相关记忆
 python src/main.py --mode memory --topic "refresh"     # 从会话日志自动提炼（演练）
 ```
 
-执行完成后，报告生成在 `reports/` 目录：
+### 交叉与合稿（当前需手动跑两条命令）
 
-- `literature_report.md` —— 分析报告（摘要 / 背景 / 中英文现状 / 研究空白 / 有价值方向）
-- `literature_references.tsv` —— 真实文献表（**可直接粘贴进 Excel**）
+`--mode` 里**没有** workflow / merge 模式——合稿层是独立脚本
+（`v0.2-spec.md` 第 5 步「main.py 串联」尚未做）：
+
+```bash
+# 1) 代码级证据底稿（无 LLM 调用）：双表 + 10 个主题桶交叉带 + 盲区对比
+python scripts/build_dual_line_evidence.py
+
+# 2) 合稿：单次 LLM 调用 + 双护栏 + 代码生成参考文献
+python scripts/merge_dual_reports.py
+```
+
+### 产物（`reports/`，默认不入库）
+
+| 文件 | 产出者 | 说明 |
+|---|---|---|
+| `literature_report.md` | `--mode literature` | 综述正文（摘要 / 背景 / 中英文现状 / 研究空白 / 有价值方向） |
+| `literature_references.tsv` | 同上 | 真实文献表，**可直接粘贴进 Excel** |
+| `market_report.md` | `--mode market` | 市场格局报告（**当前这份产于修复前，需重跑**） |
+| `market_references.tsv` | 同上 | 来源清单（URL + 抓取日期 + A/B/C 分级） |
+| `dual_line_evidence.md` | 证据底稿脚本 | 双表 + 交叉带 + 盲区，可直接阅读 |
+| `dual_line_report.md` | 合稿脚本 | 合稿正文 + 代码生成的参考文献 + 溯源附录 |
+| `academic_results.json` / `market_records.json` | 检索缓存 | 同时是两道闸门的白名单来源 |
+
+> ⚠️ 缓存即白名单：若先跑检索、后手工往文献表补过记录，报告与缓存就不同步了，
+> `verify_report.py` 会报越界。补检后把最新文献表一起传给 `--refs` 再核。
 
 ## 记忆库：让 Agent 记住你的偏好
 
@@ -224,7 +274,7 @@ python src/main.py --mode memory --topic "confirm <ID>"      # 确认续期
 python src/main.py --mode memory --topic "drop <ID>"         # 归档
 ```
 
-运行 `literature` 时，程序会按主题自动召回相关记忆，
+运行 `literature` / `market` 时，程序会按主题自动召回相关记忆，
 以「优先于你的通用写作习惯」的措辞注入分析过程。
 
 **三条设计取向**（细节见 `memory/README.md`）：
@@ -306,7 +356,7 @@ academic-research-agent/
 │   │   └── web_tool.py           # Web 检索（Tavily / DuckDuckGo）
 │   └── crews/
 │       ├── literature_crew.py    # 文献检索：分析员 → 撰稿员（无检索员）
-│       └── market_crew.py        # 市场调研：侦察员 → 分析员 → 撰稿员
+│       └── market_crew.py        # 市场调研：分析员 → 撰稿员（无侦察员）
 ├── docs/
 │   ├── v0.2-spec.md                  # 双线交叉 + 合稿规格（现行）
 │   ├── scope-decision-2026-10-13.md  # 范围决策记录
@@ -347,7 +397,8 @@ academic-research-agent/
 - [x] v0.2 可溯源护栏补齐（DOI 对账 + 移除检索员角色 + 中文相关性误杀修复）
 - [x] 双线交叉 + 两稿合并（证据底稿 + 合稿报告，八章结构 + 五条铁律）
 - [x] 配套 WorkBuddy Skill（`skill/traceable-research/`，含带外核验器）
-- [ ] **功能打磨优先**（2026-10-13 决策）：市场线 scout 空转修复、标题-DOI 配对核对、检索式回归测试
+- [x] 市场线 scout 空转修复（与文献线同款移除，Crew 降为两角色，已验证）
+- [ ] **功能打磨优先**：标题-DOI 配对核对、`query_translator` 回归测试、中文召回真实效果复测
 - [ ] 检索链路封装为一条可复用的工作流 —— **暂缓**，等检索能力稳定后再建（避免给不稳定能力固化接口）
 - [ ] 接入 `knowledge/` 领域知识库（环境工程 / 污水处理术语、个人项目语境）
 - [ ] 申请书「梳理」模块（立项依据三段式、研究内容→目标→关键科学问题拆解）
