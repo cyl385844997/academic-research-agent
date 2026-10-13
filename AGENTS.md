@@ -4,7 +4,10 @@
 
 ## 项目定位
 垂直领域（环境工程 / 污水处理）的**学术前期研究 Agent**。
-- v0.1（当前）：聚焦「论文检索」与「市场 / 竞品调研」两类前期工作，以 Python CLI 形态运行。
+- 当前版本（v0.3 口径）：**只做文献检索单线**——`--mode literature` 产出可溯源的
+  文献综述报告 + TSV 文献表。范围决策见 `docs/scope-decision-2026-10-13.md`。
+- 市场 / 竞品调研线（`--mode market`）与双线合稿层**已归档**，代码保留但暂不维护；
+  恢复前须先修该线的已知缺陷（scout 空转），回滚点 tag `v0.2-dual-line`。
 - 规划形态：**Windows 桌面应用**，内部逻辑仍由 Python + CrewAI 实现（GUI 为外壳，不重写核心）。
 
 ## 从 wisp-science 借鉴并内化的四条原则
@@ -25,14 +28,20 @@
 | `src/tools/literature_tool.py` | Semantic Scholar 真实文献检索（首选源，返回真实 DOI） |
 | `src/tools/openalex_tool.py` | OpenAlex 备用文献检索（第二回退源） |
 | `src/tools/crossref_tool.py` | Crossref 备用文献检索（第三回退源，已过滤审稿意见等非论文记录） |
-| `src/tools/web_tool.py` | Web 检索（Tavily / DuckDuckGo） |
-| `src/crews/literature_crew.py` | 论文检索三角色：检索员→分析员→撰稿员 |
-| `src/crews/market_crew.py` | 市场调研三角色 |
-| `src/main.py` | CLI 入口：`--mode literature|market|memory --topic "..."`；含三级文献源容错 |
-| `src/tools/memory_store.py` | 记忆库存储层：分文件读写、召回打分、去重、冲突检测、归档 |
+| `src/tools/cnki_tool.py` | 知网检索（经 cnki-mcp，本地已认证会话） |
+| `src/tools/query_translator.py` | 中文主题 → 英文检索式：条件角色取全部等价词、对象角色 cap 3、对象⊕条件组合 |
+| `src/tools/domain_lexicon.py` | 领域术语表（中英对照），供检索式构造与质量过滤使用 |
+| `src/crews/literature_crew.py` | 文献检索两角色：分析员 → 撰稿员（**无检索员角色**，见下） |
+| `src/main.py` | CLI 入口：`--mode literature|memory --topic "..."`；含三级文献源容错 + 两道护栏 |
+| `src/tools/memory_store.py` | 记忆库存储层：分文件读写、召回打分、去重、冲突检测、归档、TTL 复审 |
 | `src/tools/memory_extract.py` | 记忆自动整理：LLM 提炼候选 + 语义裁决（矛盾 vs 改述） |
 | `src/tools/memory_tool.py` | 记忆的 CrewAI 工具包装（Agent 运行时可检索/记待审） |
-| `knowledge/` | 领域知识沉淀（v0.2 起），当前为空 |
+| `src/crews/market_crew.py` | 【归档】市场调研三角色 |
+| `src/tools/market_query.py` | 【归档】市场检索词多维拆解 |
+| `src/tools/source_credibility.py` | 【归档】市场来源 A/B/C 分级与对比表 |
+| `src/tools/web_tool.py` | 【归档】Web 检索（Tavily / DuckDuckGo），当前仅市场线用 |
+| `docs/scope-decision-2026-10-13.md` | 单线范围决策记录：保留什么、归档什么、恢复怎么做 |
+| `knowledge/` | 领域知识沉淀（后续版本），当前为空 |
 | `reports/` | 生成报告，默认不入库 |
 | `memory/` | 长期记忆库（操作者偏好与领域约定），**默认不入库** |
 
@@ -107,11 +116,13 @@ python src/main.py --mode memory --topic "refresh"       # 自动提炼（演练
 python src/main.py --mode memory --topic "refresh" --confirm   # 真正落库
 python src/main.py --mode memory --topic "add <正文>"    # 手动加一条偏好
 python src/main.py --mode memory --topic "pending"       # 查看待审提案
-python src/main.py scripts/selftest_memory.py            # 自测（22 项）
+python src/main.py scripts/selftest_memory.py            # 记忆库自测（51 项）
+python src/main.py scripts/selftest_guardrails.py         # 护栏自测（14 项，DOI/URL 对账）
+python scripts/selftest_credibility.py                   # 来源分级自测（归档线遗留）
 ```
 
 ### 如何影响输出
-`main.py` 在 literature / market 模式下用 `build_memory_block(topic)` 按主题召回，
+`main.py` 在 literature 模式下用 `build_memory_block(topic)` 按主题召回，
 把结果作为 `memory=` 参数注入 Crew 的 context，措辞为
 「必须遵守，优先于你的通用写作习惯」。召回为空时返回空串，不影响主流程。
 
@@ -120,23 +131,36 @@ python src/main.py scripts/selftest_memory.py            # 自测（22 项）
 `main.py` 调用真实学术库 → 解析 → 代码写出。见下方「可溯源铁律」。
 
 ## 可溯源铁律的实现方式（重要）
-**文献表 / 来源表一律由代码生成，LLM 绝不参与其生成。**
-- `main.py` 先直接调用检索工具获取真实记录 → 解析 → 写出权威 TSV；
+**文献表 / 来源表一律由代码生成，LLM 绝不参与其生成；正文引用还要再过代码闸口。**
+- `main.py` 先直接调用检索工具获取真实记录 → 解析 → 代码写出权威 TSV；
 - 真实结果作为上下文注入 Crew，Agent **只做分析**，并在任务中明确禁止编造文献/来源；
-- 报告生成后，代码剥离 Agent 可能夹带的伪造表格，追加由真实数据生成的表格。
-- 任何改动都不得让 LLM 负责「列出参考文献」这件事，否则会出现
-  「真实 DOI 指向错误论文」或「DOI 根本不存在」的编造事故。
+- 报告生成后跑**两道闸口**，再追加代码生成的文献表：
+  - `sanitize_report_urls(report, allowed_urls)` —— 剥离不在检索结果内的 URL
+  - `sanitize_report_citations(report, allowed_dois)` —— 剥离不在检索结果内的 DOI
+
+### 两条从实测中固化的规则（改代码前必读）
+
+1. **prompt 约束一律不算护栏。** 实测（2026-10-12）：旧文献综述正文 51 个引用里
+   **50 个是编造的**（如 `10.1016/j.envres.2021.111609`），而当时 URL 侧已有闸口、
+   引用侧没有。Crew 提示词里写了「逐字照抄、严禁编造」，完全无效。
+   凡「模型不许编」的要求，都要有代码级白名单对账兜底。
+2. **检索已由代码完成时，不要再给 LLM 一个「检索员」角色。** tools 为空时它会凭
+   参数记忆编一份文献清单，经 context 传给下游分析与撰稿——这是假引用的源头之一。
+   `build_literature_crew()` 在有注入检索结果时已自动降为「分析员 → 撰稿员」两角色，
+   **不要改回去**。
+3. 学术线同理的市场线教训（待修）：`market_crew` 的 scout 角色会伪造检索过程，
+   把「检索政策文件返回 0 条」写进报告正文。恢复市场线前必须先移除该角色。
 
 ## 运行（开发期）
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # 填 OPENAI_API_KEY，或设 OPENAI_BASE_URL 指向 Agnes
 python src/main.py --mode literature --topic "side-stream EBPR wet weather overflow"
-python src/main.py --mode market    --topic "AI 基金申请书 产品 2026"
 ```
 
 ## 贡献约定
 - 改动前先读本文件与 README，保持「可溯源铁律」「local-first」两条不变。
+- **范围**：当前只维护文献检索单线；改动市场线（【归档】模块）前先确认是否恢复该线。
 - 新增数据源走工具 / MCP 层，不污染 crews 业务逻辑。
 - `reports/` 产物不入库（已在 `.gitignore`）。
 
@@ -146,9 +170,11 @@ python src/main.py --mode market    --topic "AI 基金申请书 产品 2026"
 - 模型可自托管 / 兼容端点，数据不出本机。
 
 ## 版本路线
-- v0.1 ✅ 论文检索 + 市场调研（CrewAI，真实可溯源文献）
-- v0.2 接入 `knowledge/` 领域知识沉淀
-- v0.3 申请书「梳理」模块
-- v0.4 申请书「撰写」模块（对接修订 / 批注留痕纪律）
-- v0.5 学术论文撰写（复用 EasySlides / Agnes 出图）
+- v0.1 ✅ 文献检索 + 市场调研（CrewAI，真实可溯源文献）
+- v0.2 ✅ 双线实跑 + 可溯源护栏补齐（DOI 对账、移除检索员角色）；范围收缩为单线
+- v0.3 ⏳ 检索链路封装为一条可复用工作流（一条命令 + 配置化主题）
+- v0.4 ⏳ 接入 `knowledge/` 领域知识沉淀
+- v0.5 申请书「梳理」模块
+- v0.6 申请书「撰写」模块（对接修订 / 批注留痕纪律）
+- v0.7 学术论文撰写（复用 EasySlides / Agnes 出图）
 - v1.x Windows 桌面应用（目标是可双击运行的 .exe）：Python 核心 + GUI 壳（倾向 CustomTkinter 画窗口、PyInstaller 打包）；**先厚能力、最后包壳**——开发期保持 CLI 便于调试，能力稳定后再套界面。

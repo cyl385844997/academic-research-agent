@@ -1,27 +1,49 @@
 # academic-research-agent
 
-> 学术前期研究 Agent —— 聚焦「论文检索」与「市场 / 竞品调研」等科研前期工作，基于 CrewAI 多角色协作，输出可溯源、可粘贴的结构化报告。
+> 学术前期研究 Agent —— 聚焦**文献检索**单线：真实学术库采集 → 代码级可溯源护栏 → 结构化文献综述报告。
 
-本仓库是逐步迭代的个人 / 团队项目。第一版只做**前期工作**（文献检索 + 市场调研），
-不生成申请书全文、不写论文全文。垂直领域（环境工程 / 污水处理）的知识沉淀留到后续版本。
+本仓库是逐步迭代的个人 / 团队项目。当前版本只做**文献检索**（不做市场 / 竞品调研，
+不做申请书全文、不写论文全文）。垂直领域（环境工程 / 污水处理）的知识沉淀留到后续版本。
 
 ## 为什么做这个
 
 市面上已有 40+ 款课题申报 / 学术写作 AI 工具，但普遍存在两个问题：
 
-1. **参考文献不可溯源**：通用大模型会编造 DOI / 期刊。本 agent 强制「文献表由代码从真实学术库抓取生成」，LLM 只做分析，从机制上杜绝编造。
+1. **参考文献不可溯源**：通用大模型会编造 DOI / 期刊。本 agent 强制「文献表由代码从真实学术库抓取生成」，LLM 只做分析，并在写稿后再用代码对账一遍 DOI。
 2. **缺乏个人 / 领域语境**：通用 SaaS 生成的本子没有「你自己的研究积累」。本项目的 `knowledge/` 目录预留用于沉淀领域知识与个人项目材料（后续版本）。
 
 ## 可溯源铁律（核心设计）
 
-**文献表 / 来源表一律由代码生成，LLM 绝不参与其生成。**
+**文献表由代码生成，LLM 绝不参与其生成；报告正文里的引用还要再过一道代码闸口。**
+
+采集与分析分离：
+
+```
+代码采集（资料员）→ 真实记录 → 代码生成 TSV 文献表 + 注入 Crew 上下文
+                                        ↓
+                              LLM 只做分析与撰写（研究员/撰稿员）
+                                        ↓
+代码对账（护栏）→ 剥离不在检索结果内的 URL / DOI → 追加代码生成的文献表
+```
 
 - `main.py` 先依次调用真实学术库 → 解析 → 写出权威 TSV；
 - 真实结果作为上下文注入 Crew，Agent **只做分析**，任务中明确禁止编造文献；
-- 报告生成后，代码剥离 Agent 可能夹带的伪造表格，追加由真实数据生成的表格。
+- 报告生成后，代码两道闸口兜底：
+  - `sanitize_report_urls()` —— 剥离不在检索结果内的 URL（标记「来源待核实」）
+  - `sanitize_report_citations()` —— 剥离不在检索结果内的 DOI（标记「DOI 不可溯源，已剔除」）
 
-> 实测记录：早期版本让 LLM 自己生成文献表，结果出现「真实 DOI 指向完全不同的论文」
-> 甚至「DOI 根本不存在」的情况。改为代码生成后，抽检 14/14 条 DOI 与官方库完全一致。
+### 为什么 prompt 里写「严禁编造」不够（实测记录）
+
+| 实测 | 结果 |
+|---|---|
+| 早期版本让 LLM 自己生成文献表 | 出现「真实 DOI 指向完全不同的论文」「DOI 根本不存在」 |
+| 仅 URL 闸口、引用层无闸口（2026-10-12 前） | 文献综述正文 51 个引用中 **50 个是编造的**，仅 1 个能溯源 |
+| 补上 DOI 闸口 + 去掉「检索员」角色后重跑 | 正文 108 处引用、82 个唯一 DOI，**0 编造**（闸口零剔除） |
+
+两条结论已固化为红线，写进 `docs/v0.2-spec.md`：
+
+1. **prompt 约束一律不算护栏**——凡「模型不许编」的要求，都要有代码级白名单对账兜底。
+2. **检索已由代码完成时，不要再给 LLM 一个「检索员」角色**——它在没有工具时会凭参数记忆编一份清单，经上下文传给下游分析与撰稿，是假引用的源头。本项目 Crew 已据此改为「分析员 → 撰稿员」两角色。
 
 ## 中文文献支持（以北大核心期刊为唯一标准）
 
@@ -77,12 +99,13 @@
 
 ---
 
-## 能力边界（v0.1）
+## 能力边界（当前版本）
 
 | 模块 | 模式 | 说明 |
 |------|------|------|
-| 论文检索 | `--mode literature` | 检索员→分析员→撰稿员 三角色，产出文献综述报告 + TSV 文献表（含真实 DOI） |
-| 市场调研 | `--mode market` | 侦察员→分析员→撰稿员 三角色，产出市场 / 竞品格局分析报告 |
+| 文献检索 | `--mode literature` | 代码采集 + 分析员→撰稿员两角色，产出文献综述报告 + TSV 文献表（DOI 经代码对账） |
+| 记忆库 | `--mode memory` | 偏好与领域约定的长期记忆，TTL 分级复审 |
+| 市场调研 | `--mode market` | **已归档，暂不维护**（见下方「已归档内容」） |
 
 ### 四级文献源（中英文并行）
 
@@ -95,8 +118,10 @@
 与中文检索并行执行。例如「侧流生物除磷」自动转成
 `(sidestream OR side-stream) AND ("biological phosphorus removal" OR EBPR)`。
 
-> ⚠️ LLM 生成的检索式会经过幻觉词校验（曾出现 `"leisure level"` 这类臆造词，
-> 导致召回大量无关文献）。检索结果再经主题相关性过滤。
+> ⚠️ 英文检索式的构造规则（2026-10-12 修复）：条件角色取**全部等价词**，
+> 对象角色 cap 3，且对象与条件做**组合查询**。旧版每角色只取首个等价词，
+> 导致「高水位」被直译为 `high water level`，实测 55 条召回大半是
+> 潮位 / 沼泽 / 地衣等无关文献；修复后 91 条主体回到排水管网压力流水力学。
 
 **文献源均无需 API key**（知网需已安装 [cnki-mcp](https://github.com/SepineTam/cnki-mcp) 并完成登录初始化）。
 
@@ -141,7 +166,6 @@ cp .env.example .env   # 然后编辑 .env 填入你的 API key
 | `OPENAI_MODEL` | 模型名 |
 | `OPENAI_BASE_URL` | OpenAI 兼容端点（可选）。已验证可用：`https://apihub.agnes-ai.com/v1`、`https://token.sensenova.cn/v1` |
 | `SEMANTIC_SCHOLAR_API_KEY` | 可选，提升文献检索速率 |
-| `TAVILY_API_KEY` | 可选，启用更稳定的 Web 检索；不填则回退 DuckDuckGo（免 key） |
 
 > ⚠️ LLM 必须支持 **function calling**（工具调用），CrewAI 的检索工具依赖此能力。
 > 可用 `curl <BASE_URL>/models` 查看端点支持的模型名。
@@ -149,11 +173,8 @@ cp .env.example .env   # 然后编辑 .env 填入你的 API key
 ## 用法
 
 ```bash
-# 论文检索与综述
+# 文献检索与综述
 python src/main.py --mode literature --topic "side-stream EBPR wet weather overflow"
-
-# 市场 / 竞品调研
-python src/main.py --mode market --topic "AI 基金申请书 产品 2026"
 
 # 记忆库
 python src/main.py --mode memory --topic "高水位"      # 查相关记忆
@@ -162,8 +183,8 @@ python src/main.py --mode memory --topic "refresh"     # 从会话日志自动�
 
 执行完成后，报告生成在 `reports/` 目录：
 
-- `literature_report.md` / `market_report.md` —— 分析报告
-- `literature_references.tsv` / `market_references.tsv` —— 真实文献表（**可直接粘贴进 Excel**）
+- `literature_report.md` —— 分析报告（摘要 / 背景 / 中英文现状 / 研究空白 / 有价值方向）
+- `literature_references.tsv` —— 真实文献表（**可直接粘贴进 Excel**）
 
 ## 记忆库：让 Agent 记住你的偏好
 
@@ -182,9 +203,14 @@ python src/main.py --mode memory --topic "add 以后给我 TSV 表格，不要 x
 python src/main.py --mode memory --topic "list"      # 看全部
 python src/main.py --mode memory --topic "stats"     # 统计
 python src/main.py --mode memory --topic "pending"   # 看待裁决的提案
+
+# TTL 分级复审（user 90 天 / project 30 天 / domain 365 天）
+python src/main.py --mode memory --topic "stale"             # 查久未确认的记忆
+python src/main.py --mode memory --topic "confirm <ID>"      # 确认续期
+python src/main.py --mode memory --topic "drop <ID>"         # 归档
 ```
 
-运行 `literature` / `market` 时，程序会按主题自动召回相关记忆，
+运行 `literature` 时，程序会按主题自动召回相关记忆，
 以「优先于你的通用写作习惯」的措辞注入分析过程。
 
 **三条设计取向**（细节见 `memory/README.md`）：
@@ -197,6 +223,18 @@ python src/main.py --mode memory --topic "pending"   # 看待裁决的提案
 3. **记忆库不入库**。本仓库是 public，而记忆含你的个人偏好与在办课题，
    已由 `.gitignore` 排除，仅目录说明随仓库保留。
 
+## 已归档内容（暂不维护）
+
+2026-10-13 决策：项目收缩为**文献检索单线**。以下内容已实跑验证并保留在仓库中，
+但不作为当前开发重点；如需恢复完整双线行为，可回到 tag `v0.2-dual-line`：
+
+| 内容 | 位置 | 说明 |
+|------|------|------|
+| 市场 / 竞品调研 | `--mode market`、`src/crews/market_crew.py`、`src/tools/market_query.py`、`src/tools/source_credibility.py` | 曾实跑产出 13 条分级来源的真实市场报告；含来源 A/B/C 分级逻辑 |
+| 双线合稿层 | `scripts/merge_dual_reports.py`、`scripts/build_dual_line_evidence.py` | 两篇报告合成一篇 + 代码级证据底稿（交叉带 / 盲区） |
+
+决策依据见 `docs/scope-decision-2026-10-13.md`。
+
 ## 目录结构
 
 ```
@@ -207,36 +245,52 @@ academic-research-agent/
 ├── .env.example
 ├── .gitignore
 ├── src/
-│   ├── main.py                   # CLI 入口 + 多源容错 + 文献表生成
+│   ├── main.py                   # CLI 入口 + 多源容错 + 文献表生成 + 两道护栏
 │   ├── tools/
 │   │   ├── literature_tool.py    # Semantic Scholar 文献检索
 │   │   ├── openalex_tool.py      # OpenAlex 备用文献检索
 │   │   ├── crossref_tool.py      # Crossref 备用文献检索
-│   │   └── web_tool.py           # Web 检索（Tavily / DuckDuckGo）
+│   │   ├── cnki_tool.py          # 知网检索（经 cnki-mcp）
+│   │   ├── core_journals.py      # 北大核心期刊白名单（77 种）
+│   │   ├── domain_lexicon.py     # 领域术语表（中英对照）
+│   │   ├── query_translator.py   # 中文主题 → 英文检索式构造
+│   │   ├── memory_*.py           # 记忆库：存储 / 提炼 / 工具包装
+│   │   ├── market_*.py           # 【归档】市场调研相关
+│   │   └── web_tool.py           # 【归档】Web 检索
 │   └── crews/
-│       ├── literature_crew.py    # 论文检索三角色
-│       └── market_crew.py        # 市场调研三角色
-├── knowledge/                    # 预留：领域知识 / 个人项目材料沉淀（后续版本）
+│       ├── literature_crew.py    # 文献检索：分析员 → 撰稿员（无检索员）
+│       └── market_crew.py        # 【归档】市场调研三角色
+├── docs/
+│   ├── scope-decision-2026-10-13.md   # 单线范围决策记录
+│   ├── v0.2-spec.md                  # 双线方案（历史决策，含收缩说明）
+│   └── company_profile-schema-v1.md  # 条件档案 schema（已暂缓）
+├── scripts/                      # 护栏回归自测 + 实跑脚本
+├── knowledge/                    # 预留：领域知识沉淀（后续版本）
 └── reports/                      # 生成的报告（默认不入库）
 ```
 
 ## 架构
 
-每个 Crew 由三个角色顺序协作（`Process.sequential`）：
+文献检索链路（`Process.sequential`）：
 
-- **检索员 / 侦察员**：调用工具收集原始资料（真实文献 + 网络信息）。
-- **分析员**：归纳现状、识别研究空白或市场差异化机会。
-- **撰稿员**：产出结构化 markdown 报告（**不负责生成文献表**）。
+- **代码采集（资料员，不经 LLM）**：多源检索 → 解析 → 去重 → 质量过滤（中文按北大核心白名单）→ 均衡 → 生成 TSV 与注入上下文；
+- **分析员**：归纳研究现状、识别研究空白（须分别梳理中文与英文进展）；
+- **撰稿员**：产出结构化 markdown 报告（**不负责生成文献表**）；
+- **代码对账**：写稿后剥离伪造引用（URL + DOI 两道闸口），追加代码生成的文献表。
 
-文献表由 `main.py` 在 Crew 之外用代码生成并追加，保证可溯源。
+> 检索员角色已移除：检索由代码完成，Agent 无需复述代码已拿到的结果——
+> 实测该角色在无工具时会编造文献清单，是假引用的源头之一。
 
 ## 路线图
 
-- [x] v0.1 论文检索 + 市场调研（CrewAI 多角色，文献表代码生成、可溯源）
-- [ ] v0.2 接入 `knowledge/` 领域知识库（环境工程 / 污水处理术语、个人项目语境）
-- [ ] v0.3 申请书「梳理」模块（立项依据三段式、研究内容→目标→关键科学问题拆解）
-- [ ] v0.4 申请书「撰写」模块（对接修订 / 批注留痕纪律，输出可进 Word 修订模式）
-- [ ] v0.5 学术论文撰写模块（大纲→综述→正文，复用 EasySlides / Agnes 出图）
+- [x] v0.1 文献检索 + 市场调研（CrewAI 多角色，文献表代码生成、可溯源）
+- [x] 记忆库 TTL 分级复审（user 90 / project 30 / domain 365 天，过期降权不删除）
+- [x] v0.2 可溯源护栏补齐（DOI 对账 + 移除检索员角色）；双线实跑后收缩为文献检索单线
+- [ ] 检索链路封装为一条可复用的工作流（配置化 / 一条命令跑完整链路）
+- [ ] 接入 `knowledge/` 领域知识库（环境工程 / 污水处理术语、个人项目语境）
+- [ ] 申请书「梳理」模块（立项依据三段式、研究内容→目标→关键科学问题拆解）
+- [ ] 申请书「撰写」模块（对接修订 / 批注留痕纪律，输出可进 Word 修订模式）
+- [ ] 学术论文撰写模块（大纲→综述→正文，复用 EasySlides / Agnes 出图）
 - [ ] v1.0 Windows 桌面应用（CustomTkinter + PyInstaller 打包为可双击 .exe；先厚能力、最后包壳）
 
 ## 贡献
