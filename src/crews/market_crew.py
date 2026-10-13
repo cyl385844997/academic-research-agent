@@ -1,8 +1,9 @@
 """市场 / 竞品调研 Crew：侦察员 → 分析员 → 撰稿员 三角色协作。
 
-【归档 2026-10-13】项目已收缩为「文献检索」单线，本模块暂不维护。
-恢复使用前须先修 scout 空转问题（tools=[] 时该角色会伪造检索过程），
-详见 docs/scope-decision-2026-10-13.md。
+【scout 空转已修（2026-10-13）】此前 scout 角色在 tools=[] 时会角色扮演检索，把不存在的
+检索（如「检索政策文件返回 0 条」）写进报告正文。现在与文献线同一处理：
+代码完成检索后，Crew 自动降为「分析员 → 撰稿员」两角色，检索结果直接注入上下文。
+核验方法：`skill/traceable-research/scripts/verify_report.py` 会检出这类伪造检索措辞。
 
 与文献检索 Crew 的差异
 ----------------------
@@ -82,6 +83,10 @@ def build_market_crew(topic: str, llm, tools, search_results: str = "",
         expected_output="竞品 / 产品清单（含定位、功能要点，并注明来源可信度）。",
         agent=scout,
     )
+    analyze_kwargs = {}
+    if not search_results:
+        analyze_kwargs["context"] = [scout_task]
+
     analyze_task = Task(
         description=(
             f"分析「{topic}」的市场格局、技术路线、功能同质化程度、尚未被满足的差异化空白。\n"
@@ -91,7 +96,7 @@ def build_market_crew(topic: str, llm, tools, search_results: str = "",
         ),
         expected_output="市场格局分析 + 技术路线梳理 + 差异化空白判断（标注证据等级）。",
         agent=analyst,
-        context=[scout_task],
+        **analyze_kwargs,
     )
     write_task = Task(
         description=(
@@ -114,6 +119,19 @@ def build_market_crew(topic: str, llm, tools, search_results: str = "",
         context=[analyze_task],
         output_file="reports/market_report.md",
     )
+
+    if search_results:
+        # 检索已由代码完成（build_market_queries + search_web + classify_source），
+        # **不设「侦察员」角色**。实测（2026-10-12）：tools=[] 时该角色会角色扮演
+        # 检索，把不存在的检索（「检索政策文件返回 0 条」）写进报告正文，
+        # 措辞还很像真的；这类断言一旦流进对外材料就是失实。
+        # 与 literature_crew 同一处理：资料员/研究员分工，LLM 只分析已保存的数据。
+        return Crew(
+            agents=[analyst, writer],
+            tasks=[analyze_task, write_task],
+            process=Process.sequential,
+            verbose=True,
+        )
 
     return Crew(
         agents=[scout, analyst, writer],

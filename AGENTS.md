@@ -3,11 +3,10 @@
 > 本文件面向 AI agent 与代码协作者。人类读者请看 README.md。
 
 ## 项目定位
-垂直领域（环境工程 / 污水处理）的**学术前期研究 Agent**。
-- 当前版本（v0.3 口径）：**只做文献检索单线**——`--mode literature` 产出可溯源的
-  文献综述报告 + TSV 文献表。范围决策见 `docs/scope-decision-2026-10-13.md`。
-- 市场 / 竞品调研线（`--mode market`）与双线合稿层**已归档**，代码保留但暂不维护；
-  恢复前须先修该线的已知缺陷（scout 空转），回滚点 tag `v0.2-dual-line`。
+垂直领域（环境工程 / 污水处理）的**学术前期研究 Agent**，做**检索**与**交叉**。
+- 范围内三条能力：**文献检索**（`--mode literature`）、**市场/竞品检索**（`--mode market`）、
+  **两线交叉 + 两稿合并**（证据底稿 + 合稿报告）。规格见 `docs/v0.2-spec.md`。
+- 范围外：「该不该我们做」的结论、申请书/论文全文、付费库爬取（理由见 spec 第 1 节）。
 - 规划形态：**Windows 桌面应用**，内部逻辑仍由 Python + CrewAI 实现（GUI 为外壳，不重写核心）。
 
 ## 从 wisp-science 借鉴并内化的四条原则
@@ -32,15 +31,17 @@
 | `src/tools/query_translator.py` | 中文主题 → 英文检索式：条件角色取全部等价词、对象角色 cap 3、对象⊕条件组合 |
 | `src/tools/domain_lexicon.py` | 领域术语表（中英对照），供检索式构造与质量过滤使用 |
 | `src/crews/literature_crew.py` | 文献检索两角色：分析员 → 撰稿员（**无检索员角色**，见下） |
-| `src/main.py` | CLI 入口：`--mode literature|memory --topic "..."`；含三级文献源容错 + 两道护栏 |
+| `src/crews/market_crew.py` | 市场调研三角色：**scout 有已知缺陷待修**（伪造检索过程） |
+| `src/tools/market_query.py` | 市场检索词多维拆解（通用中文/英文/技术路线/产品名/应用案例） |
+| `src/tools/source_credibility.py` | 市场来源 A/B/C 分级与对比表生成 |
+| `src/tools/web_tool.py` | Web 检索（Tavily / DuckDuckGo），市场线采集用 |
+| `scripts/merge_dual_reports.py` | 两稿合稿：单次 LLM 调用合成一篇 + 双护栏 + 代码生成参考文献 |
+| `scripts/build_dual_line_evidence.py` | 代码级证据底稿：双表 + 交叉带 + 盲区 |
+| `src/main.py` | CLI 入口：`--mode literature|market|memory --topic "..."`；含三级文献源容错 + 两道护栏 |
 | `src/tools/memory_store.py` | 记忆库存储层：分文件读写、召回打分、去重、冲突检测、归档、TTL 复审 |
 | `src/tools/memory_extract.py` | 记忆自动整理：LLM 提炼候选 + 语义裁决（矛盾 vs 改述） |
 | `src/tools/memory_tool.py` | 记忆的 CrewAI 工具包装（Agent 运行时可检索/记待审） |
-| `src/crews/market_crew.py` | 【归档】市场调研三角色 |
-| `src/tools/market_query.py` | 【归档】市场检索词多维拆解 |
-| `src/tools/source_credibility.py` | 【归档】市场来源 A/B/C 分级与对比表 |
-| `src/tools/web_tool.py` | 【归档】Web 检索（Tavily / DuckDuckGo），当前仅市场线用 |
-| `docs/scope-decision-2026-10-13.md` | 单线范围决策记录：保留什么、归档什么、恢复怎么做 |
+| `docs/scope-decision-2026-10-13.md` | 范围决策记录：范围内三条能力、范围外三项、当前待办 |
 | `knowledge/` | 领域知识沉淀（后续版本），当前为空 |
 | `reports/` | 生成报告，默认不入库 |
 | `memory/` | 长期记忆库（操作者偏好与领域约定），**默认不入库** |
@@ -118,11 +119,11 @@ python src/main.py --mode memory --topic "add <正文>"    # 手动加一条偏�
 python src/main.py --mode memory --topic "pending"       # 查看待审提案
 python src/main.py scripts/selftest_memory.py            # 记忆库自测（51 项）
 python src/main.py scripts/selftest_guardrails.py         # 护栏自测（14 项，DOI/URL 对账）
-python scripts/selftest_credibility.py                   # 来源分级自测（归档线遗留）
+python scripts/selftest_credibility.py                   # 来源分级自测
 ```
 
 ### 如何影响输出
-`main.py` 在 literature 模式下用 `build_memory_block(topic)` 按主题召回，
+`main.py` 在 literature / market 模式下用 `build_memory_block(topic)` 按主题召回，
 把结果作为 `memory=` 参数注入 Crew 的 context，措辞为
 「必须遵守，优先于你的通用写作习惯」。召回为空时返回空串，不影响主流程。
 
@@ -160,7 +161,7 @@ python src/main.py --mode literature --topic "side-stream EBPR wet weather overf
 
 ## 贡献约定
 - 改动前先读本文件与 README，保持「可溯源铁律」「local-first」两条不变。
-- **范围**：当前只维护文献检索单线；改动市场线（【归档】模块）前先确认是否恢复该线。
+- **范围**：文献检索、市场检索、交叉与合稿三条能力都在范围内；改动前先读 `docs/v0.2-spec.md`。
 - 新增数据源走工具 / MCP 层，不污染 crews 业务逻辑。
 - `reports/` 产物不入库（已在 `.gitignore`）。
 
