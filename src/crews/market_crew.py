@@ -3,7 +3,7 @@
 【scout 空转已修（2026-10-13）】此前 scout 角色在 tools=[] 时会角色扮演检索，把不存在的
 检索（如「检索政策文件返回 0 条」）写进报告正文。现在与文献线同一处理：
 代码完成检索后，Crew 自动降为「分析员 → 撰稿员」两角色，检索结果直接注入上下文。
-核验方法：`skill/traceable-research/scripts/verify_report.py` 会检出这类伪造检索措辞。
+核验方法：`skills/traceable-research/scripts/verify_report.py` 会检出这类伪造检索措辞。
 
 与文献检索 Crew 的差异
 ----------------------

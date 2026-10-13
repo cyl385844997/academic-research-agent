@@ -304,32 +304,50 @@ python src/main.py --mode memory --topic "drop <ID>"         # 归档
 
 ## 配套 Skill（WorkBuddy）
 
-仓库内自带一个 WorkBuddy Skill：`skill/traceable-research/`，把本项目的
-**使用姿势与产物核验方法**固化下来，供 AI agent 调用。覆盖两条检索线与合稿产物。
+仓库内自带一个 WorkBuddy Skill：`skills/traceable-research/`，采用与
+[ppt-master](https://github.com/hugohe3/ppt-master/blob/main/skills/ppt-master/SKILL.md)
+相同的组织约定——`skills/<name>/SKILL.md` 作为**路由 + 全局纪律**层，
+细则拆到 `workflows/`，领域知识放 `references/`，确定性脚本放 `scripts/`。
 
 **定位分工**：`academic-search` 类 skill 负责「尽可能多地找到文献」，
 本 Skill 负责「两条线的采集纪律 + 交付物每条引用可溯源 + 中文质量判据 + 产物带外抽检」。
 
-| 内容 | 说明 |
-|---|---|
-| `SKILL.md` | 何时触发、前置检查、两条线工作流、交付话术纪律 |
-| `scripts/verify_report.py` | **带外核验器**：纯标准库、不依赖本项目，对任意 markdown 报告抽检 DOI/URL 是否在白名单内，并检出伪造检索措辞 |
-| `references/` | 护栏与实测数据、中文质量判据、检索式构造规则、故障速查 |
+```
+skills/traceable-research/
+├── SKILL.md                      # 路由 + 术语表 + 全局执行/交付纪律
+├── workflows/
+│   ├── routing.md                # 需求信号 → 工作流
+│   ├── literature.md             # 工作流 A：文献检索
+│   ├── market.md                 # 工作流 B：市场/竞品检索
+│   └── cross-merge.md            # 工作流 C：两线交叉 + 两稿合并
+├── scripts/
+│   ├── preflight.py              # 前置闸门：项目根/.env/依赖/核验器/中文前置
+│   └── verify_report.py          # 带外核验器（纯标准库，不依赖本项目）
+└── references/                   # 护栏与实测数据、中文质量判据、检索式构造、故障速查
+```
+
+约定要点（与 ppt-master 一致）：把 SKILL.md 所在目录记为 `SKILL_DIR`，
+所有相对路径用 `${SKILL_DIR}` 展开，**不 cd、不假设仓库检出位置**；
+先跑 `preflight.py` 过闸门，再按 routing 选**恰好一条**工作流，只读该工作流细则。
 
 ```bash
-# 核验一份报告（退出码 0 通过 / 1 有越界引用 / 2 需人工复核）
-python skill/traceable-research/scripts/verify_report.py \
+# 1) 前置闸门（--deep 会额外跑项目三套自测）
+python skills/traceable-research/scripts/preflight.py --topic "排水管网高水位检测" --deep
+
+# 2) 带外核验（退出码 0 通过 / 1 有越界引用 / 2 需人工复核）
+python skills/traceable-research/scripts/verify_report.py \
   reports/literature_report.md --refs reports/academic_results.json
 
-# 打包成可分发 zip（输出到 dist/）
-python <skill-creator>/scripts/package_skill.py skill/traceable-research ./dist
+# 3) 打包成可分发 zip（输出到 dist/）
+python <skill-creator>/scripts/package_skill.py skills/traceable-research ./dist
 ```
 
 安装：把 `dist/traceable-research.zip` 解压到 `~/.workbuddy/skills/` 即可；
 skill 通过环境变量 `ARA_HOME` 定位本项目（默认 `~/academic-research-agent`）。
 
-实测三份产物：修复后的文献报告**通过**；市场报告 URL 全在册但**检出伪造检索措辞**
-（scout 空转痕迹）；修复前的旧报告**检出 48 个越界 DOI**。
+实测：`preflight.py` 通过并串联三套自测（护栏 14 / 质量过滤 11 / 记忆库 51 全绿）；
+带外核验器验过三份产物——修复后的文献报告**通过**；市场报告 URL 全在册但
+**检出伪造检索措辞**（修复前的 scout 空转痕迹）；修复前的旧报告**检出 48 个越界 DOI**。
 
 ## 目录结构
 
@@ -361,7 +379,7 @@ academic-research-agent/
 │   ├── v0.2-spec.md                  # 双线交叉 + 合稿规格（现行）
 │   ├── scope-decision-2026-10-13.md  # 范围决策记录
 │   └── company_profile-schema-v1.md  # 条件档案 schema（已暂缓）
-├── skill/traceable-research/         # 配套 WorkBuddy Skill（含带外核验器）
+├── skills/traceable-research/        # 配套 WorkBuddy Skill（路由+三工作流+核验器）
 ├── scripts/                          # 护栏自测 + 合稿脚本 + 实跑脚本
 ├── dist/                             # Skill 分发包（package_skill.py 产出）
 ├── knowledge/                    # 预留：领域知识沉淀（后续版本）
@@ -396,7 +414,7 @@ academic-research-agent/
 - [x] 记忆库 TTL 分级复审（user 90 / project 30 / domain 365 天，过期降权不删除）
 - [x] v0.2 可溯源护栏补齐（DOI 对账 + 移除检索员角色 + 中文相关性误杀修复）
 - [x] 双线交叉 + 两稿合并（证据底稿 + 合稿报告，八章结构 + 五条铁律）
-- [x] 配套 WorkBuddy Skill（`skill/traceable-research/`，含带外核验器）
+- [x] 配套 WorkBuddy Skill（`skills/traceable-research/`，路由 + 三工作流 + 前置闸门 + 带外核验器）
 - [x] 市场线 scout 空转修复（与文献线同款移除，Crew 降为两角色，已验证）
 - [ ] **功能打磨优先**：标题-DOI 配对核对、`query_translator` 回归测试、中文召回真实效果复测
 - [ ] 检索链路封装为一条可复用的工作流 —— **暂缓**，等检索能力稳定后再建（避免给不稳定能力固化接口）
